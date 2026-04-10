@@ -2,6 +2,8 @@
 
 本项目整理自《Little Book of Deep Learning》，提供中文笔记便于学习和参考。
 
+> 浏览器查看推荐安装 [MathJax 3 插件](https://chromewebstore.google.com/detail/mathjax-3-plugin-for-gith/peoghobgdhejhcmgoppjpjcidngdfkod) 以获得更好的阅读体验。
+
 ## Foundations 章节
 
 ### [第一章：机器学习](1_foundations.md)
