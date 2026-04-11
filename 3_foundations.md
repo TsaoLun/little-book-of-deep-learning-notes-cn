@@ -13,7 +13,7 @@
 
 
 $$
-P̂(Y = y | X = x) = exp(f(x;w)_{y}) / \sum_z exp(f(x;w)_z)
+\hat{P}(Y = y \mid X = x) = \frac{\exp(f(x;w)_y)}{\sum_z \exp(f(x;w)_z)}
 $$
 
 
