@@ -13,7 +13,7 @@
 
 
 $$
-\hat{P}(Y = y \mid X = x) = \frac{\exp(f(x;w)_y)}{\sum_z \exp(f(x;w)_z)}
+\hat{P}(Y = y \mid X = x) = \frac{\exp f(x;w)_y}{\sum_z \exp f(x;w)_z}
 $$
 
 
@@ -28,7 +28,7 @@ $$
 
 
 $$
-= - (1/N) \sum_{n=1}^{N} log [exp(f(x_n;w)_{y_n}) / \sum_z exp(f(x_n;w)_z)]
+= \frac{1}{N}\sum_{n=1}^{N}-log\frac{exp f(x_n;w)_{y_n}}{\sum_z exp f(x_n;w)_z}
 $$
 
 
