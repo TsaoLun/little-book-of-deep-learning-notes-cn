@@ -23,7 +23,7 @@ $$
 
 
 $$
-\mathcal{L}_ce(w) = -\frac{1}{N} \sum_{n=1}^{N} log\hat{P}(Y = y_n | X = x_n)
+\mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^{N} log\hat{P}(Y = y_n | X = x_n)
 $$
 
 
