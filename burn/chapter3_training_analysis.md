@@ -470,9 +470,13 @@ impl<B: Backend> SimpleOptimizer<B> for Sgd<B> {
 #### 专家：权重衰减与 L2 正则化
 
 **理论公式**：
-总损失：$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{data}} + \frac{\lambda}{2} \|w\|^2$
+总损失：
 
-梯度：$\nabla_w \mathcal{L}_{\text{total}} = \nabla_w \mathcal{L}_{\text{data}} + \lambda w$
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{data}} + \frac{\lambda}{2} \|w\|^2$$
+
+梯度：
+
+$$\nabla_w \mathcal{L}_{\text{total}} = \nabla_w \mathcal{L}_{\text{data}} + \lambda w$$
 
 **符号解释**：
 - $\mathcal{L}_{\text{total}}$：包含正则化的总损失
