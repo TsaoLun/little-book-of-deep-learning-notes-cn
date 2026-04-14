@@ -122,6 +122,7 @@ let loss_value = loss.forward(logits, targets);
 #### 进阶：数学公式与源码对应
 
 **数学公式**：
+
 $$
 \mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^{N} \log\hat{P}(Y = y_n | X = x_n)
 = \frac{1}{N}\sum_{n=1}^{N}-\log\frac{\exp f(x_n;w)_{y_n}}{\sum_z \exp f(x_n;w)_z}
