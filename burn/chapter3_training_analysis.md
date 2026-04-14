@@ -142,7 +142,7 @@ $$
 - $x_n$：第 $n$ 个输入样本
 - $y_n$：第 $n$ 个样本的真实类别
 - $f(x_n;w)_{y_n}$：模型 $f$ 在参数 $w$ 下，输入 $x_n$ 时在真实类别 $y_n$ 上的 logit 输出
-- $z$：求和变量，遍历所有可能的类别
+- z：求和变量，遍历所有可能的类别
 - $\hat{P}(Y = y_n | X = x_n)$：给定输入 $x_n$ 时预测类别为 $y_n$ 的条件概率估计（即 softmax 输出）
 
 **Burn 源代码**：`crates/burn-nn/src/loss/cross_entropy.rs`
