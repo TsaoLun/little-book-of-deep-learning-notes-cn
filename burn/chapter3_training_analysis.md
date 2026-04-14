@@ -236,8 +236,8 @@ $$
 - $x_b$：正样本（positive），与锚点属于同一类别（$y_a = y_b$）
 - $x_c$：负样本（negative），与锚点属于不同类别（$y_a \neq y_c$）
 - $y_a, y_b, y_c$：样本 $x_a, x_b, x_c$ 的类别标签
-- $f(x_a, x_b; w)$：模型$f$ 在参数 $w$ 下计算的 $x_a$ 与 $x_b$ 之间的相似度
-- $f(x_a, x_c; w)$：模型$f$ 在参数 $w$ 下计算的 $x_a$ 与 $x_c$ 之间的相似度
+- $f(x_a, x_b; w)$：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_b$ 之间的相似度
+- $f(x_a, x_c; w)$：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_c$ 之间的相似度
 - $w$：模型参数
 
 **Burn 源代码**：`crates/burn-nn/src/loss/cosine_embedding.rs`
