@@ -18,6 +18,8 @@
 
 Softmax 是分类任务的基础，将 logits 转换为概率分布，是交叉熵损失的前置步骤。
 
+> logits 指的是模型输出的未归一化分数（非归一化概率的对数）。Softmax 函数将这些 logits 转换为概率分布，使得所有类别概率之和为 1。
+
 #### 进阶：数学公式与源码对应
 
 **数学公式**：
@@ -61,6 +63,16 @@ pub fn log_softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize)
 **代码解释**：
 1. **softmax 实现**：$\text{softmax}(x_i) = \frac{\exp(x_i - \max(x))}{\sum_j \exp(x_j - \max(x))}$
 2. **log_softmax 实现**：$\log\text{softmax}(x_i) = (x_i - \max(x)) - \log\sum_j \exp(x_j - \max(x))$
+
+**为什么需要对 softmax 输出求对数？**
+
+在交叉熵损失函数中，我们需要计算预测概率分布的负对数似然。交叉熵 $H(p,q) = -\sum_i p_i \log q_i$ 衡量真实分布 $p$ 与预测分布 $q$ 之间的差异。对于分类任务：
+- 真实分布 $p$ 是 one-hot 向量（仅在真实类别位置为 1，其余为 0）
+- 预测分布 $q$ 是 softmax 输出的概率分布
+
+因此交叉熵简化为 $-\log q(y)$，其中 $y$ 是真实类别索引。这就是为什么在计算交叉熵损失时，需要对 softmax 输出取对数。
+
+数值上，直接计算 $\log(\text{softmax}(x))$ 容易导致数值下溢，因为当 $\text{softmax}(x_i)$ 接近 0 时，$\log(0)$ 会得到 $-\infty$。因此 Burn 框架（及其他深度学习框架）提供了 `log_softmax` 函数，它使用 log-sum-exp 技巧稳定地计算 $\log(\text{softmax}(x))$。
 
 #### 专家：数值稳定性深入分析
 
@@ -255,8 +267,8 @@ $$
 其中 $d$ 是距离函数，$\alpha$ 是边界（margin）。
 
 **公式转换**：
-- 相似样本：$1 - \cos(x_1, x_2)$，最小化时使 $\cos(x_1, x_2) \to 1$
-- 不相似样本：$\max(0, \cos(x_1, x_2) - \text{margin})$，最小化时使 $\cos(x_1, x_2) < \text{margin}$
+- 相似样本：$1 - \cos(x_1, x_2)$，最小化使 $\cos(x_1, x_2) \to 1$
+- 不相似样本：$\max(0, \cos(x_1, x_2) - \text{margin})$，最小化使 $\cos(x_1, x_2) < \text{margin}$
 
 **余弦相似度的完整实现**（`crates/burn-tensor/src/tensor/linalg/cosine_similarity.rs`）：
 
