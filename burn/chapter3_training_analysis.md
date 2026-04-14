@@ -265,7 +265,8 @@ pub fn forward_no_reduction<B: Backend>(
 $$
 \mathcal{L}_{\text{triplet}} = \max(0, d(x_a, x_p) - d(x_a, x_n) + \alpha)
 $$
-其中 $d$ 是距离函数，$\alpha$ 是边界（margin）。
+
+其中$d$ 是距离函数，$\alpha$ 是边界（margin）。
 
 **公式转换**：
 - 相似样本：$1 - \cos(x_1, x_2)$，最小化使 $\cos(x_1, x_2) \to 1$
