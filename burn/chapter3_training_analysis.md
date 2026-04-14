@@ -174,6 +174,7 @@ fn forward_default(&self, logits: Tensor<B, 2>, targets: Tensor<B, 1, Int>) -> T
 #### 专家：完整推导与等价形式
 
 **等价形式**（计算更稳定）：
+
 $$
 \mathcal{L}_{ce} = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n)_{y_n} - \log\sum_z \exp(f(x_n)_z) \right]
 $$
@@ -384,6 +385,7 @@ optimizer.step(&model, grads);
 #### 进阶：梯度下降更新公式
 
 **数学公式**：
+
 $$
 w_{n+1} = w_n - \eta \nabla\mathcal{L}|_w(w_n)
 $$
