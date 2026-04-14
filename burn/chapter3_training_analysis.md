@@ -290,7 +290,7 @@ $$
 
 **公式转换**：
 - 相似样本：$1 - \cos(x_1, x_2)$，最小化使 $\cos(x_1, x_2) \to 1$
-- 不相似样本：$\max(0, \cos(x_1, x_2) - \text{margin})$，最小化使 $\cos(x_1, x_2) < \text{margin}$
+- 不相似样本：$\max(0, \cos(x_1, x_2) - \text{margin})$，最小化使$\cos(x_1, x_2) < \text{margin}$
 
 **余弦相似度的完整实现**（`crates/burn-tensor/src/tensor/linalg/cosine_similarity.rs`）：
 
