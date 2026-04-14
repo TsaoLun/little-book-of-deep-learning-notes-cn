@@ -70,6 +70,8 @@ pub fn log_softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize)
 **代码解释**：
 1. **softmax 实现**：$\text{softmax}(x_i) = \frac{\exp(x_i - \max(x))}{\sum_j \exp(x_j - \max(x))}$
 2. **log_softmax 实现**：$\log\text{softmax}(x_i) = (x_i - \max(x)) - \log\sum_j \exp(x_j - \max(x))$
+3. **`detach()`**：防止梯度流向 `max_dim` 计算，否则反向传播时最大值选取会参与梯度图
+4. **减去最大值**：确保指数运算的输入$\leq 0$，防止 `exp` 溢出至 `inf`
 
 **为什么需要对 softmax 输出求对数？**
 
@@ -80,18 +82,6 @@ pub fn log_softmax<const D: usize, B: Backend>(tensor: Tensor<B, D>, dim: usize)
 因此交叉熵简化为 $-\log q(y)$，其中 $y$ 是真实类别索引。这就是为什么在计算交叉熵损失时，需要对 softmax 输出取对数。
 
 数值上，直接计算 $\log(\text{softmax}(x))$ 容易导致数值下溢，因为当 $\text{softmax}(x_i)$ 接近 0 时，$\log(0)$ 会得到 $-\infty$。因此 Burn 框架（及其他深度学习框架）提供了 `log_softmax` 函数，它使用 log-sum-exp 技巧稳定地计算 $\log(\text{softmax}(x))$。
-
-#### 专家：数值稳定性深入分析
-
-**数值稳定版本原理**：
-$$
-\text{softmax}(x_i) = \frac{\exp(x_i - \max(x))}{\sum_j \exp(x_j - \max(x))}
-$$
-
-Burn 实现的三个关键细节：
-1. **`detach()`**：防止梯度流向 `max_dim` 计算，否则反向传播时最大值选取会参与梯度图
-2. **减去最大值**：确保指数运算的输入$\leq 0$，防止 `exp` 溢出至 `inf`
-3. **顺序设计**：先 `exp` 再 `sum`，保持数学定义的清晰性
 
 ---
 
