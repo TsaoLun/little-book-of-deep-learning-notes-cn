@@ -276,7 +276,7 @@ pub fn forward_no_reduction<B: Backend>(
 |---------|---------|------|
 | $f(x_a, x_b; w)$ | `cosine_similarity(input1, input2, 1, None)` | 余弦相似度作为距离函数 |
 | $1 - f(x_a, x_b; w)$ | `cos_sim.clone().neg().add_scalar(1)` | 相似样本损失 |
-| $\max(0, f(x_a, x_c; w) - \text{margin})$ | `relu(cos_sim.clone().sub_scalar(self.margin))` | 不相似样本损失（带边界） |
+|$\max(0, f(x_a, x_c; w) - \text{margin})$| `relu(cos_sim.clone().sub_scalar(self.margin))` | 不相似样本损失（带边界） |
 | 样本类型选择 | `.mask_where(mask, loss)` | 根据 target 值选择相应损失 |
 
 #### 专家：三元组形式与余弦相似度计算细节
