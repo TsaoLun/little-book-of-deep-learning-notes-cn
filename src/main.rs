@@ -85,8 +85,14 @@ mod tests {
         let targets_wrong = Tensor::<Backend, 1, Int>::from_ints([0], &device);
         let loss_wrong = loss_fn.forward(logits_wrong, targets_wrong);
 
+        let logits_medium = Tensor::<Backend, 2>::from_floats([[10.0, 8.0, -10.0]], &device);
+        let targets_medium = Tensor::<Backend, 1, Int>::from_ints([0], &device);
+        let loss_medium = loss_fn.forward(logits_medium, targets_medium);
+
         let perfect: f32 = loss_perfect.into_scalar().elem();
         let wrong: f32 = loss_wrong.into_scalar().elem();
+        let medium: f32 = loss_medium.into_scalar().elem();
+        println!("完美预测损失: {perfect}, 错误预测损失: {wrong}, 中等预测损失: {medium}");
 
         // 验证：完美预测的损失应远小于错误预测
         assert!(
