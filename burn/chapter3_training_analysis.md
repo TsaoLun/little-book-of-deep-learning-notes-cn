@@ -239,7 +239,13 @@ fn forward_default(&self, logits: Tensor<B, 2>, targets: Tensor<B, 1, Int>) -> T
 #### 专家：数值稳定性与实现细节
 
 **代码实现与等价形式的关系**：
-前面的等价形式 $\mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n;w)_{y_n} - \log\sum_z \exp(f(x_n;w)_z) \right]$ 正是代码中 `log_softmax` 函数的数学表达。具体对应关系如下：
+前面的等价形式： 
+
+$$
+\mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n;w)_{y_n} - \log\sum_z \exp(f(x_n;w)_z) \right]
+$$
+
+正是代码中 `log_softmax` 函数的数学表达。具体对应关系如下：
 
 1. **`log_softmax` 输出**：对于输入 logits $f(x)$，`log_softmax` 的第 $i$ 个输出为 $f(x)_i - \log\sum_z \exp(f(x)_z)$
 2. **提取真实类别**：`.gather(1, targets)` 选择真实类别 $y_n$ 对应的值，得到 $f(x)_{y_n} - \log\sum_z \exp(f(x)_z)$
