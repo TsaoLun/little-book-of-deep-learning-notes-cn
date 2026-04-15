@@ -134,8 +134,8 @@ let loss_value = loss.forward(logits, targets);
 **为什么交叉熵需要对 softmax 输出求对数？**
 
 交叉熵 $H(p,q) = -\sum_i p_i \log q_i$ 衡量真实分布 $p$ 与预测分布 $q$ 之间的差异。对于分类任务：
-- 真实分布 $p$ 是 one-hot 向量（仅在真实类别位置为 1，其余为 0）
-- 预测分布 $q$ 是 softmax 输出的概率分布
+- 真实分布 *$p$* 是 one-hot 向量（仅在真实类别位置为 1，其余为 0）
+- 预测分布 *$q$* 是 softmax 输出的概率分布
 
 因此交叉熵简化为 $-\log q(y)$，其中 $y$ 是真实类别索引。这就是为什么代码中使用 1.1 节介绍的 `log_softmax` 来计算交叉熵损失。
 
