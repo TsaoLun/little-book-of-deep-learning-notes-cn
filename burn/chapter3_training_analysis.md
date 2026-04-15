@@ -157,6 +157,13 @@ $$
 - *${z}$*：求和变量，遍历所有可能的类别
 - *$\hat{P}(Y = y_n | X = x_n)$*：给定输入 $x_n$ 时预测类别为 $y_n$ 的条件概率估计（即 softmax 输出）
 
+**等价形式（计算更稳定）**：
+上面的公式 $\mathcal{L}_{ce}(w) = -\frac{1}{N}\sum_{n=1}^{N}\log\frac{\exp f(x_n;w)_{y_n}}{\sum_z \exp f(x_n;w)_z}$ 可以进一步展开为等价形式：
+$$
+\mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n;w)_{y_n} - \log\sum_z \exp(f(x_n;w)_z) \right]
+$$
+这个形式在数值计算上更稳定，因为它避免了先计算 softmax（可能产生接近 0 的值）再取对数（可能导致 $-\infty$）的问题。**这个等价形式正是下面代码实现所采用的形式**，通过 `log_softmax` 函数直接计算 $f(x)_{y} - \log\sum_z \exp(f(x)_z)$。
+
 **Burn 源代码**：`crates/burn-nn/src/loss/cross_entropy.rs`
 
 **log_softmax 实现**（位于 `crates/burn-tensor/src/tensor/activation/base.rs`）：
@@ -221,24 +228,29 @@ fn forward_default(&self, logits: Tensor<B, 2>, targets: Tensor<B, 1, Int>) -> T
 | $-\frac{1}{N} \sum_{n=1}^{N}$ | `.mean().neg()` | 取平均后取负 |
 | 加权版本 | `tensor.sum().neg() / weights.sum()` | 加权平均 |
 
-#### 专家：完整推导与等价形式
+#### 专家：数值稳定性与实现细节
 
-**等价形式**（计算更稳定）：
+**代码实现与等价形式的关系**：
+前面的等价形式 $\mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n;w)_{y_n} - \log\sum_z \exp(f(x_n;w)_z) \right]$ 正是代码中 `log_softmax` 函数的数学表达。具体对应关系如下：
 
-$$
-\mathcal{L}_{ce} = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n)_{y_n} - \log\sum_z \exp(f(x_n)_z) \right]
-$$
+1. **`log_softmax` 输出**：对于输入 logits $f(x)$，`log_softmax` 的第 $i$ 个输出为 $f(x)_i - \log\sum_z \exp(f(x)_z)$
+2. **提取真实类别**：`.gather(1, targets)` 选择真实类别 $y_n$ 对应的值，得到 $f(x)_{y_n} - \log\sum_z \exp(f(x)_z)$
+3. **平均取负**：`.mean().neg()` 计算 $-\frac{1}{N}\sum_{n=1}^N$
 
-**符号说明**：公式中各符号含义与前述交叉熵损失公式相同。
+**数值稳定性机制**：
+`log_softmax` 的实现（见上文）包含两个关键技巧：
+1. **减去最大值**：$x_i' = x_i - \max(x)$，确保所有指数运算的输入 $\leq 0$，防止 `exp` 溢出至 `inf`
+2. **`detach()`**：防止梯度流向 `max_dim` 计算，因为减去最大值只是为了数值稳定，不改变数学结果
 
-**数学等价性证明**：
-1. `log_softmax(logits, 1)` 的第 $i$ 个输出 $= f(x)_i - \log\sum_z \exp(f(x)_z)$（利用 log 的性质展开）
-2. `.gather(1, targets)` 从中选择真实类别 $y_n$ 对应的值，得到 $f(x)_{y_n} - \log\sum_z \exp(f(x)_z)$
-3. `.mean().neg()` = $-\frac{1}{N}\sum_{n=1}^N$
+**为何这种形式更优**：
+对比两种计算路径：
+- **路径 A（先 softmax 再 log）**：$\log(\text{softmax}(x)) = \log\left(\frac{\exp(x_i)}{\sum_j \exp(x_j)}\right)$
+  - 问题：如果 softmax 输出接近 0，取对数会得到 $-\infty$
+- **路径 B（log_softmax）**：$\log\text{softmax}(x_i) = x_i - \log\sum_j \exp(x_j)$
+  - 优势：避免中间的小概率值，直接使用 log-sum-exp 技巧，数值稳定且计算高效
 
-**为何使用 log_softmax 而非先 softmax 再 log**：
-- 数值上更稳定：直接使用 log-sum-exp 技巧，避免先算 softmax（可能接近 0）再取对数（$\log(0) = -\infty$）
-- 计算上更高效：减少一次 exp 运算和一次除法运算
+**与 1.1 节的联系**：
+这里使用的数值稳定性技巧与 1.1 节 `softmax` 的实现一致，体现了 Burn 框架对数值稳定性的系统化处理。
 
 ---
 
