@@ -123,7 +123,7 @@ let loss_value = loss.forward(logits, targets);
 - 真实分布 *$p$* 是 one-hot 向量（仅在真实类别位置为 1，其余为 0）
 - 预测分布 *$q$* 是 softmax 输出的概率分布
 
-当 *$p$* 是 one-hot 向量时（设真实类别为 $y$，即 $p_y = 1$，$p_i = 0$ 当 $i \neq y$），交叉熵简化为：
+当 *$p$* 是 one-hot 向量时（设真实类别为 $y$，即 *$p_y = 1$*，$p_i = 0$ 当 $i \neq y$），交叉熵简化为：
 $$
 H(p,q) = -\sum_i p_i \log q_i = -1 \cdot \log q_y - \sum_{i \neq y} 0 \cdot \log q_i = -\log q(y)
 $$
