@@ -56,8 +56,11 @@ mod tests {
         // 使用示例
         let logits =
             Tensor::<Backend, 2>::random([batch_size, num_classes], Distribution::Normal(0., 1.), &device);
+        println!("Logits 输入: {}\n", logits);
         let targets = Tensor::<Backend, 1, Int>::from_ints([0, 2, 1], &device);
+        println!("目标类别索引: {}\n", targets);
         let loss_value = loss_fn.forward(logits, targets);
+        println!("交叉熵损失值: {}\n", loss_value);
 
         // 验证：损失值应为标量（形状 [1]），且为正数
         assert_eq!(loss_value.dims(), [1]);
