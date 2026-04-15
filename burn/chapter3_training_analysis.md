@@ -40,11 +40,11 @@ $$
 $$
 
 **符号解释**：
-- $X$：输入变量，$x$ 是具体的输入样本
-- $Y$：输出类别变量，$y$ 是具体的类别索引
-- $f(x;w)_y$：模型$f$ 在参数$w$ 下，输入$x$ 时输出的第$y$ 个 logit 值
+- *$X$*：输入变量，$x$ 是具体的输入样本
+- *$Y$*：输出类别变量，$y$ 是具体的类别索引
+- *$f(x;w)_y$*：模型$f$ 在参数$w$ 下，输入$x$ 时输出的第$y$ 个 logit 值
 - *${z}$*：求和变量，遍历所有可能的类别
-- $\hat{P}(Y = y \mid X = x)$：给定输入 $x$ 时预测类别为 $y$ 的条件概率估计
+- *$\hat{P}(Y = y \mid X = x)$*：给定输入 $x$ 时预测类别为 $y$ 的条件概率估计
 
 **Burn 源代码**：`crates/burn-tensor/src/tensor/activation/base.rs`
 
@@ -147,14 +147,14 @@ $$
 $$
 
 **符号解释**：
-- $\mathcal{L}_{ce}(w)$：参数为 $w$ 时的交叉熵损失
-- $N$：训练样本总数
-- $n$：样本索引，$n = 1, 2, \dots, N$
-- $x_n$：第 $n$ 个输入样本
-- $y_n$：第 $n$ 个样本的真实类别
-- $f(x_n;w)_{y_n}$：模型$f$ 在参数 $w$ 下，输入 $x_n$ 时在真实类别 $y_n$ 上的 logit 输出
+- *$\mathcal{L}_{ce}(w)$*：参数为 $w$ 时的交叉熵损失
+- *$N$*：训练样本总数
+- *$n$*：样本索引，$n = 1, 2, \dots, N$
+- *$x_n$*：第 $n$ 个输入样本
+- *$y_n$*：第 $n$ 个样本的真实类别
+- *$f(x_n;w)_{y_n}$*：模型$f$ 在参数 $w$ 下，输入 $x_n$ 时在真实类别 $y_n$ 上的 logit 输出
 - *${z}$*：求和变量，遍历所有可能的类别
-- $\hat{P}(Y = y_n | X = x_n)$：给定输入 $x_n$ 时预测类别为 $y_n$ 的条件概率估计（即 softmax 输出）
+- *$\hat{P}(Y = y_n | X = x_n)$*：给定输入 $x_n$ 时预测类别为 $y_n$ 的条件概率估计（即 softmax 输出）
 
 **Burn 源代码**：`crates/burn-nn/src/loss/cross_entropy.rs`
 
@@ -252,14 +252,14 @@ $$
 $$
 
 **符号解释**：
-- $\mathcal{L}_{\text{contrastive}}$：对比损失
-- $x_a$：锚点（anchor）样本
+- *$\mathcal{L}_{\text{contrastive}}$*：对比损失
+- *$x_a$*：锚点（anchor）样本
 - *$x_b$*：正样本（positive），与锚点属于同一类别（$y_a = y_b$）
-- $x_c$：负样本（negative），与锚点属于不同类别（$y_a \neq y_c$）
-- $y_a, y_b, y_c$：样本 $x_a, x_b, x_c$ 的类别标签
-- $f(x_a, x_b; w)$：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_b$ 之间的相似度
-- $f(x_a, x_c; w)$：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_c$ 之间的相似度
-- $w$：模型参数
+- *$x_c$*：负样本（negative），与锚点属于不同类别（$y_a \neq y_c$）
+- *$y_a, y_b, y_c$*：样本 $x_a, x_b, x_c$ 的类别标签
+- *$f(x_a, x_b; w)$*：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_b$ 之间的相似度
+- *$f(x_a, x_c; w)$*：模型$f$ 在参数 $w$ 下计算的$x_a$ 与$x_c$ 之间的相似度
+- *$w$*：模型参数
 
 **Burn 源代码**：`crates/burn-nn/src/loss/cosine_embedding.rs`
 
@@ -433,10 +433,10 @@ w_{n+1} = w_n - \eta \nabla\mathcal{L}|_w(w_n)
 $$
 
 **符号解释**：
-- $w_n$：第 $n$ 次迭代时的模型参数
-- $w_{n+1}$：更新后的模型参数
-- $\eta$：学习率（learning rate），控制参数更新步长
-- $\nabla\mathcal{L}|_w(w_n)$：损失函数 $\mathcal{L}$ 在参数 $w_n$ 处的梯度
+- *$w_n$*：第 $n$ 次迭代时的模型参数
+- *$w_{n+1}$*：更新后的模型参数
+- *$\eta$*：学习率（learning rate），控制参数更新步长
+- *$\nabla\mathcal{L}|_w(w_n)$*：损失函数 $\mathcal{L}$ 在参数 $w_n$ 处的梯度
 
 **Burn 源代码**：`crates/burn-optim/src/optim/sgd.rs`
 
@@ -500,13 +500,13 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{data}} + \frac{\lambda}{2} \|w
 $$\nabla_w \mathcal{L}_{\text{total}} = \nabla_w \mathcal{L}_{\text{data}} + \lambda w$$
 
 **符号解释**：
-- $\mathcal{L}_{\text{total}}$：包含正则化的总损失
-- $\mathcal{L}_{\text{data}}$：仅数据部分的损失（不含正则化）
-- $\lambda$：权重衰减系数（正则化强度）
-- $w$：模型参数
-- $\|w\|^2$：参数 $w$ 的 L2 范数平方
-- $\nabla_w \mathcal{L}_{\text{total}}$：总损失对参数 $w$ 的梯度
-- $\nabla_w \mathcal{L}_{\text{data}}$：数据损失对参数 $w$ 的梯度
+- *$\mathcal{L}_{\text{total}}$*：包含正则化的总损失
+- *$\mathcal{L}_{\text{data}}$*：仅数据部分的损失（不含正则化）
+- *$\lambda$*：权重衰减系数（正则化强度）
+- *$w$*：模型参数
+- *$\|w\|^2$*：参数 $w$ 的 L2 范数平方
+- *$\nabla_w \mathcal{L}_{\text{total}}$*：总损失对参数 $w$ 的梯度
+- *$\nabla_w \mathcal{L}_{\text{data}}$*：数据损失对参数 $w$ 的梯度
 
 **Burn 实现**（`crates/burn-optim/src/optim/decay.rs`）：
 
@@ -538,14 +538,14 @@ w_{t+1} &= w_t - \eta v_{t+1}
 $$
 
 **符号解释**：
-- $v_t$：第 $t$ 次迭代时的动量（速度）
-- $v_{t+1}$：更新后的动量
-- $\mu$：动量因子，控制历史动量的保留比例
-- $\tau$：阻尼因子
-- $g_t$：第 $t$ 次迭代时的梯度
-- $w_t$：第 $t$ 次迭代时的模型参数
-- $w_{t+1}$：更新后的模型参数
-- $\eta$：学习率
+- *$v_t$*：第 $t$ 次迭代时的动量（速度）
+- *$v_{t+1}$*：更新后的动量
+- *$\mu$*：动量因子，控制历史动量的保留比例
+- *$\tau$*：阻尼因子
+- *$g_t$*：第 $t$ 次迭代时的梯度
+- *$w_t$*：第 $t$ 次迭代时的模型参数
+- *$w_{t+1}$*：更新后的模型参数
+- *$\eta$*：学习率
 
 **Burn 源代码**：`crates/burn-optim/src/optim/momentum.rs`
 
@@ -662,12 +662,12 @@ $$
 $$
 
 **符号解释**：
-- $\eta_t$：第 $t$ 步时的学习率
-- $\eta_{\min}$：最小学习率
-- $\eta_{\max}$：最大学习率
-- $T_{\text{cur}}$：当前训练步数
-- $T_{\max}$：总训练步数
-- $\pi$：圆周率
+- *$\eta_t$*：第 $t$ 步时的学习率
+- *$\eta_{\min}$*：最小学习率
+- *$\eta_{\max}$*：最大学习率
+- *$T_{\text{cur}}$*：当前训练步数
+- *$T_{\max}$*：总训练步数
+- *$\pi$*：圆周率
 
 **Burn 源代码**：`crates/burn-optim/src/lr_scheduler/cosine.rs`
 
@@ -830,10 +830,10 @@ g & \text{if } \|g\| \leq \text{threshold} \\
 $$
 
 **符号解释**：
-- $g_{\text{clipped}}$：裁剪后的梯度
-- $g$：原始梯度
-- $\|g\|$：梯度 $g$ 的范数（通常指 L2 范数）
-- $\text{threshold}$：裁剪阈值，当梯度范数超过该值时进行裁剪
+- *$g_{\text{clipped}}$*：裁剪后的梯度
+- *$g$*：原始梯度
+- *$\|g\|$*：梯度 $g$ 的范数（通常指 L2 范数）
+- *$\text{threshold}$*：裁剪阈值，当梯度范数超过该值时进行裁剪
 
 **Burn 源代码**：`crates/burn-optim/src/grad_clipping.rs`
 
