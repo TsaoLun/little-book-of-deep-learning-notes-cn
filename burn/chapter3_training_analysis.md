@@ -158,10 +158,18 @@ $$
 - *$\hat{P}(Y = y_n | X = x_n)$*：给定输入 $x_n$ 时预测类别为 $y_n$ 的条件概率估计（即 softmax 输出）
 
 **等价形式（计算更稳定）**：
-上面的公式 $\mathcal{L}_{ce}(w) = -\frac{1}{N}\sum_{n=1}^{N}\log\frac{\exp f(x_n;w)_{y_n}}{\sum_z \exp f(x_n;w)_z}$ 可以进一步展开为等价形式：
+上面的公式 
+
+$$
+\mathcal{L}_{ce}(w) = -\frac{1}{N}\sum_{n=1}^{N}\log\frac{\exp f(x_n;w)_{y_n}}{\sum_z \exp f(x_n;w)_z}
+$$ 
+
+可以进一步展开为等价形式：
+
 $$
 \mathcal{L}_{ce}(w) = -\frac{1}{N} \sum_{n=1}^N \left[ f(x_n;w)_{y_n} - \log\sum_z \exp(f(x_n;w)_z) \right]
 $$
+
 这个形式在数值计算上更稳定，因为它避免了先计算 softmax（可能产生接近 0 的值）再取对数（可能导致 $-\infty$）的问题。**这个等价形式正是下面代码实现所采用的形式**，通过 `log_softmax` 函数直接计算 $f(x)_{y} - \log\sum_z \exp(f(x)_z)$。
 
 **Burn 源代码**：`crates/burn-nn/src/loss/cross_entropy.rs`
