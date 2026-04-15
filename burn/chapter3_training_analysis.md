@@ -121,12 +121,20 @@ let loss_value = loss.forward(logits, targets);
 
 在机器学习中，我们将交叉熵作为损失函数 $\mathcal{L}_{ce}$。对于分类任务：
 - 真实分布 *$p$* 是 one-hot 向量（仅在真实类别位置为 1，其余为 0）
-- 预测分布 *$q$* 是 softmax 输出的概率分布
+- 预测分布 *$q$* 是 softmax 输出的概率分布 *$\log\hat{P}(Y = y | X = x)$*
 
 当 *$p$* 是 one-hot 向量时（设真实类别为 $y$，即 *$p_y = 1$*，$p_i = 0$ 当 $i \neq y$），交叉熵简化为：
+
 $$
 H(p,q) = -\sum_i p_i \log q_i = -1 \cdot \log q_y - \sum_{i \neq y} 0 \cdot \log q_i = -\log q(y)
 $$
+
+即
+
+$$
+H(p,q) = -\log \hat{P}(Y = y | X = x)
+$$
+
 其中 $y$ 是真实类别索引。这个简化揭示了交叉熵损失的本质：我们只需关注真实类别的预测概率的对数。这也是为什么代码中直接使用 `log_softmax` 来计算交叉熵损失（其实现见下文）——它直接提供了所需的 $\log q(y)$。
 
 **从信息论交叉熵到机器学习损失函数**：
