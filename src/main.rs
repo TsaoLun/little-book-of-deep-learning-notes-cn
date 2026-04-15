@@ -4,9 +4,9 @@ fn main() {}
 mod tests {
     use burn::backend::Flex;
     // use burn::backend::ndarray::NdArray;
+    use burn::nn::loss::{CosineEmbeddingLossConfig, CrossEntropyLossConfig};
     use burn::prelude::*;
-    use burn::nn::loss::CrossEntropyLossConfig;
-    use burn::tensor::{activation, Distribution};
+    use burn::tensor::{Distribution, activation};
 
     // type Backend = NdArray<f32>;
     type Backend = Flex<f32>;
@@ -19,8 +19,11 @@ mod tests {
         let num_classes = 3;
 
         // 将 logits 转换为概率分布
-        let logits =
-            Tensor::<Backend, 2>::random([batch_size, num_classes], Distribution::Normal(0., 1.), &device);
+        let logits = Tensor::<Backend, 2>::random(
+            [batch_size, num_classes],
+            Distribution::Normal(0., 1.),
+            &device,
+        );
         println!("Logits 输出: {}\n", logits);
         let probabilities = activation::softmax(logits, 1); // 沿类别维度（dim=1）计算 softmax
         println!("Softmax 概率分布: {}\n", probabilities);
@@ -36,8 +39,14 @@ mod tests {
         // 验证：所有概率值应在 [0, 1] 范围内
         let min_val: f32 = probabilities.clone().min().into_scalar().elem::<f32>();
         let max_val: f32 = probabilities.max().into_scalar().elem::<f32>();
-        assert!(min_val >= 0.0, "Softmax 输出最小值应 >= 0，实际为 {min_val}");
-        assert!(max_val <= 1.0, "Softmax 输出最大值应 <= 1，实际为 {max_val}");
+        assert!(
+            min_val >= 0.0,
+            "Softmax 输出最小值应 >= 0，实际为 {min_val}"
+        );
+        assert!(
+            max_val <= 1.0,
+            "Softmax 输出最大值应 <= 1，实际为 {max_val}"
+        );
     }
 
     /// 1.2 交叉熵损失：衡量预测概率分布与真实分布的差异
@@ -54,8 +63,11 @@ mod tests {
             .init::<Backend>(&device);
 
         // 使用示例
-        let logits =
-            Tensor::<Backend, 2>::random([batch_size, num_classes], Distribution::Normal(0., 1.), &device);
+        let logits = Tensor::<Backend, 2>::random(
+            [batch_size, num_classes],
+            Distribution::Normal(0., 1.),
+            &device,
+        );
         println!("Logits 输入: {}\n", logits);
         let targets = Tensor::<Backend, 1, Int>::from_ints([0, 2, 1], &device);
         println!("目标类别索引: {}\n", targets);
@@ -100,5 +112,46 @@ mod tests {
             "完美预测损失 ({perfect}) 应小于错误预测损失 ({wrong})"
         );
     }
-}
 
+    #[test]
+    fn test_contrastive_loss() {
+        let loss = CosineEmbeddingLossConfig::new()
+            .with_margin(0.5) // 边界值
+            .init();
+        let device = Default::default();
+
+        // 三个样本对，设计为可手算的固定向量：
+        //
+        // 样本 0：target=1（相似），input1 == input2 → cosine=1.0 → loss = 1-1.0 = 0.0
+        // 样本 1：target=-1（不相似），input1 == input2 → cosine=1.0 → loss = max(0, 1.0-0.5) = 0.5  ← 惩罚最大
+        // 样本 2：target=1（相似），两向量正交 → cosine=0.0 → loss = 1-0.0 = 1.0                   ← 损失最大
+        //
+        // 预期平均损失 = (0.0 + 0.5 + 1.0) / 3 ≈ 0.5
+        let input1 = Tensor::<Backend, 2>::from_floats(
+            [
+                [1.0, 0.0, 0.0, 0.0], // 样本 0
+                [1.0, 0.0, 0.0, 0.0], // 样本 1
+                [1.0, 0.0, 0.0, 0.0], // 样本 2
+            ],
+            &device,
+        );
+        let input2 = Tensor::<Backend, 2>::from_floats(
+            [
+                [1.0, 0.0, 0.0, 0.0], // 样本 0：与 input1 完全相同
+                [1.0, 0.0, 0.0, 0.0], // 样本 1：与 input1 完全相同（但标注为不相似，产生惩罚）
+                [0.0, 1.0, 0.0, 0.0], // 样本 2：与 input1 正交（但标注为相似，损失为 1）
+            ],
+            &device,
+        );
+        let target = Tensor::from_ints([1, -1, 1], &device); // 1 表示相似，-1 表示不相似
+
+        let loss_value = loss.forward(input1, input2, target);
+        let scalar: f32 = loss_value.clone().into_scalar().elem();
+        println!("Cosine Embedding Loss: {scalar}");
+        // 验证预期平均损失
+        assert!(
+            (scalar - 0.5).abs() < 1e-5,
+            "预期损失 ≈ 0.5，实际为 {scalar}"
+        );
+    }
+}
