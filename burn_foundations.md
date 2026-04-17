@@ -732,7 +732,7 @@ let config = AdamWConfig::new()           // 默认：β1=0.9, β2=0.999, ε=1e-
     .with_cautious_weight_decay(true)     // 谨慎权重衰减变体
     .with_amsgrad(false);                 // AMSGrad 变体
 
-// init() 返回优化器实例（与 Learner 配合使用，见 §6.3）
+// init() 返回优化器实例（与 Learner 配合使用，见 [§6.3](burn_foundations.md#63-训练循环trainstep-inferencestep)）
 let optimizer = config.init();
 ```
 
@@ -963,7 +963,7 @@ impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
 }
 ```
 
-注意泛型参数 `C: CheckpointStrategy`——这对应于 §3.4 原文中提到的**检查点技术**：反向传播需保留前向传播的所有中间激活，内存与深度成比例增长。检查点技术通过仅存储部分层的激活、在反向传播时重新计算其余层来交换计算时间与内存 [Chen et al., 2016]。Burn 通过 `CheckpointStrategy` 泛型在编译期选择策略，默认 `NoCheckpointing` 保留所有激活。
+注意泛型参数 `C: CheckpointStrategy`——这对应于 [§3.4](burn_foundations.md#34-学习率调度learning-rate-scheduling) 原文中提到的**检查点技术**：反向传播需保留前向传播的所有中间激活，内存与深度成比例增长。检查点技术通过仅存储部分层的激活、在反向传播时重新计算其余层来交换计算时间与内存 [Chen et al., 2016]。Burn 通过 `CheckpointStrategy` 泛型在编译期选择策略，默认 `NoCheckpointing` 保留所有激活。
 
 #### 进阶：链式法则
 
@@ -1148,7 +1148,7 @@ fn clip_by_norm<B: Backend, const D: usize>(
 
 ## 5. 深度的价值（The Value of Depth）
 
-正如“深度学习”一词所示，实用的模型通常是长系列映射的组合 $f = f^{(D)} \circ \cdots \circ f^{(1)}$。用梯度下降训练会使各层产生复杂的共同适应——尽管优化过程是渐进且局部的，但深度模型能够逐层变形输入空间的表示，直到数据变得线性可分。理论结果表明，对于固定的计算预算或参数数量，增加深度会导致模型能表示的映射复杂度更高 [Telgarsky, 2016]。当前最先进的性能需要数十层的模型，如残差网络（§5.2）或 Transformer（§5.3）。
+正如“深度学习”一词所示，实用的模型通常是长系列映射的组合 $f = f^{(D)} \circ \cdots \circ f^{(1)}$。用梯度下降训练会使各层产生复杂的共同适应——尽管优化过程是渐进且局部的，但深度模型能够逐层变形输入空间的表示，直到数据变得线性可分。理论结果表明，对于固定的计算预算或参数数量，增加深度会导致模型能表示的映射复杂度更高 [Telgarsky, 2016]。当前最先进的性能需要数十层的模型，如残差网络（见 [§5.2 卷积神经网络](burn_deepmodels.md#52-卷积神经网络卷积神经网络-cnn)）或 Transformer（见 [§5.3 Transformer 架构](burn_deepmodels.md#53-transformer-架构)）。
 
 #### 入门：模块化层组合
 
@@ -1186,7 +1186,7 @@ impl<B: Backend> ConvNet<B> {
     }
 
     fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
-        // 逐层手动调用，直观对应 §3.5 中的 f = f^(D) ∘ ... ∘ f^(1)
+        // 逐层手动调用，直观对应 [§3.5](burn_deepmodels.md#41-层的概念) 中的 f = f^(D) ∘ ... ∘ f^(1)
         let x = relu(self.bn1.forward(self.conv1.forward(x)));
         let x = relu(self.bn2.forward(self.conv2.forward(x)));
         let [b, c, h, w] = x.dims();
@@ -1195,7 +1195,7 @@ impl<B: Backend> ConvNet<B> {
 }
 ```
 
-> `#[derive(Module)]` 是 Burn 的核心设计：结构体字段自动成为可训练参数，`Module` trait 提供 `.to_device()`、`.no_grad()`、`.fork()` 等方法。层数越多，`forward` 中链式调用越长，直观映射了 §3.5 中"$D$ 个映射的组合"。
+> `#[derive(Module)]` 是 Burn 的核心设计：结构体字段自动成为可训练参数，`Module` trait 提供 `.to_device()`、`.no_grad()`、`.fork()` 等方法。层数越多，`forward` 中链式调用越长，直观映射了 [§3.5](burn_deepmodels.md#41-层的概念) 中"$D$ 个映射的组合"。
 
 #### 进阶：Module trait 的核心接口
 
@@ -1300,7 +1300,7 @@ fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
 
 ## 6. 训练协议（Training Protocols）
 
-训练深度网络需要一整套协议，以充分利用计算和数据，确保模型在新数据上表现良好。正如 §3.6 所述，这至少需要三组互不相交的数据：**训练集**（优化参数）、**验证集**（调整超参数、监控过拟合）、**测试集**（最终评估）。完整训练分为多个 epoch，每个 epoch 遍历一次所有训练样本。损失的典型动态是：训练损失持续下降，而验证损失可能在若干 epoch 后到达最小值后回升——这反映了过拟合。
+训练深度网络需要一整套协议，以充分利用计算和数据，确保模型在新数据上表现良好。正如 [§3.6](burn_foundations.md#61-数据集与分割) 所述，这至少需要三组互不相交的数据：**训练集**（优化参数）、**验证集**（调整超参数、监控过拟合）、**测试集**（最终评估）。完整训练分为多个 epoch，每个 epoch 遍历一次所有训练样本。损失的典型动态是：训练损失持续下降，而验证损失可能在若干 epoch 后到达最小值后回升——这反映了过拟合。
 
 ### 6.1 数据集与分割
 
@@ -1377,7 +1377,7 @@ let dataset: SqliteDataset<TextItem> = HuggingfaceDatasetLoader::new("ag_news")
 
 ### 6.2 数据加载器
 
-DataLoader 负责将数据集样本组装为 mini-batch 并送入模型。§3.3 中提到 SGD 的核心思想是每次只用一部分数据估计梯度——DataLoader 正是实现这一机制的组件。
+DataLoader 负责将数据集样本组装为 mini-batch 并送入模型。[§3.3](burn_foundations.md#31-随机梯度下降sgd) 中提到 SGD 的核心思想是每次只用一部分数据估计梯度——DataLoader 正是实现这一机制的组件。
 
 ```rust
 use burn::data::dataloader::DataLoaderBuilder;
@@ -1484,7 +1484,7 @@ let training = SupervisedTraining::new(
         dataloader_valid,       // 验证集 DataLoader
     )
     .metrics((AccuracyMetric::new(), LossMetric::new()))   // 追踪准确率和损失
-    .early_stopping(MetricEarlyStoppingStrategy::new(      // 早停策略（见 §6.4）
+    .early_stopping(MetricEarlyStoppingStrategy::new(      // 早停策略（见 [§6.4](burn_foundations.md#64-指标系统metrics)）
         &LossMetric::<B>::new(),
         Aggregate::Mean,
         Direction::Lowest,
@@ -1532,7 +1532,7 @@ pub trait Adaptor<T> {
 
 ### 6.5 早停（Early Stopping）
 
-§3.6 指出验证损失可能在若干 epoch 后开始回升（过拟合），早停策略可以在这种情况下自动终止训练。
+[§3.6](burn_foundations.md#65-早停early-stopping) 指出验证损失可能在若干 epoch 后开始回升（过拟合），早停策略可以在这种情况下自动终止训练。
 
 **Burn 源代码**：`crates/burn-train/src/learner/early_stopping.rs`
 
@@ -1553,7 +1553,7 @@ let early_stopping = MetricEarlyStoppingStrategy::new(
 
 ### 6.6 微调（Fine-tuning）
 
-§3.6 强调微调是将预训练模型适配到下游任务的核心手段——特别是当下游任务数据有限时，预训练模型编码的统计结构提供了良好的归纳偏置。在 Burn 中通过 `load_record` 加载预训练权重，然后用 `no_grad()` 选择性冻结部分层：
+[§3.6](burn_foundations.md#66-微调fine-tuning) 强调微调是将预训练模型适配到下游任务的核心手段——特别是当下游任务数据有限时，预训练模型编码的统计结构提供了良好的归纳偏置。在 Burn 中通过 `load_record` 加载预训练权重，然后用 `no_grad()` 选择性冻结部分层：
 
 ```rust
 // 1. 加载预训练模型权重
