@@ -513,18 +513,23 @@ let token_ids = encoding.get_ids(); // 得到令牌 ID 序列，可转换为 Bur
 **Burn 实现**：`burn_optim::Sgd`
 
 ```rust
-use burn_optim::{SgdConfig, Optimizer};
+use burn_optim::{SgdConfig, Optimizer, momentum::MomentumConfig, decay::WeightDecayConfig, GradientsParams};
 
 let config = SgdConfig::new()
-    .with_momentum(0.9) // 动量
-    .with_weight_decay(0.0001) // 权重衰减
-    .with_nesterov(true); // Nesterov 动量
+    .with_momentum(Some(MomentumConfig {
+        momentum: 0.9,   // 动量因子
+        dampening: 0.1,  // 阻尼因子
+        nesterov: true,  // Nesterov 动量
+    }))
+    .with_weight_decay(Some(WeightDecayConfig { penalty: 0.0001 })); // 权重衰减系数
 
-let mut optimizer = config.init(&model);
+let mut optimizer = config.init();
 
-// 训练循环中的优化步骤
+// 训练循环中的优化步骤（简化示例）
+let learning_rate = 0.01;
 let grads = loss.backward();
-optimizer.step(&model, grads);
+let grads = GradientsParams::from_grads(grads, &model);
+model = optimizer.step(learning_rate, model, grads);
 ```
 
 #### 进阶：梯度下降更新公式
