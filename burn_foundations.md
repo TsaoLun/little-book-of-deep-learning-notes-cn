@@ -342,8 +342,8 @@ pub fn forward_no_reduction<B: Backend>(
 **代码与公式对应关系**：
 | 公式部分 | 代码实现 | 说明 |
 |---------|---------|------|
-| $f(x_a, x_b; w)$ | `cosine_similarity(input1, input2, 1, None)` | 余弦相似度作为距离函数 |
-| $1 - f(x_a, x_b; w)$ | `cos_sim.clone().neg().add_scalar(1)` | 相似样本损失 |
+| *$f(x_a, x_b; w)$* | `cosine_similarity(input1, input2, 1, None)` | 余弦相似度作为距离函数 |
+| *$1 - f(x_a, x_b; w)$* | `cos_sim.clone().neg().add_scalar(1)` | 相似样本损失 |
 | *$\max(0, f(x_a, x_c; w) - \text{margin})$* | `relu(cos_sim.clone().sub_scalar(self.margin))` | 不相似样本损失（带边界） |
 | 样本类型选择 | `.mask_where(mask, loss)` | 根据 target 值选择相应损失 |
 
