@@ -3,6 +3,7 @@ fn main() {}
 #[cfg(test)]
 mod tests {
     use burn::backend::Flex;
+    use burn::nn::attention::generate_autoregressive_mask;
     // use burn::backend::ndarray::NdArray;
     use burn::nn::loss::{CosineEmbeddingLossConfig, CrossEntropyLossConfig};
     use burn::prelude::*;
@@ -152,6 +153,31 @@ mod tests {
         assert!(
             (scalar - 0.5).abs() < 1e-5,
             "预期损失 ≈ 0.5，实际为 {scalar}"
+        );
+    }
+
+    #[test]
+    fn test_generate_autoregressive_mask() {
+        let device = Default::default();
+
+        let mask = generate_autoregressive_mask::<Backend>(2, 4, &device);
+        println!("Autoregressive Mask: {}\n", mask);
+        mask.into_data().assert_eq(
+            &TensorData::from([
+                [
+                    [false, true, true, true],
+                    [false, false, true, true],
+                    [false, false, false, true],
+                    [false, false, false, false],
+                ],
+                [
+                    [false, true, true, true],
+                    [false, false, true, true],
+                    [false, false, false, true],
+                    [false, false, false, false],
+                ],
+            ]),
+            false,
         );
     }
 }

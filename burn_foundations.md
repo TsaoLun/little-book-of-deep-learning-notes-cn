@@ -432,13 +432,14 @@ $$
 **Burn 源代码**：`crates/burn-nn/src/modules/attention/mask.rs`
 
 ```rust
-// 生成自回归掩码：下三角矩阵，确保位置 t 只能看到 t' <= t
+// 生成自回归掩码：上三角为 true（遮蔽未来位置），下三角为 false（可见）
 pub fn generate_autoregressive_mask<B: Backend>(
     batch_size: usize,
     seq_length: usize,
     device: &B::Device,
 ) -> Tensor<B, 3, Bool> {
-    // tril_mask 生成 [seq_length, seq_length] 下三角布尔矩阵
+    // tril_mask: 下三角(含对角线)=false(可见), 上三角=true(遮蔽)
+    // 例如 3×3: [[false, true, true], [false, false, true], [false, false, false]]
     let mask = Tensor::<B, 2, Bool>::tril_mask([seq_length, seq_length], 0, device);
     mask.expand([batch_size, seq_length, seq_length])
 }
@@ -937,6 +938,28 @@ let loss = z.mean();
 let grads = loss.backward(); // 自动计算梯度
 ```
 
+`Autodiff<B>` 是一个泛型装饰器，可包装任意后端 `B`（如 `Wgpu`、`Cuda`、`NdArray` 等）。其内部实现：
+
+```rust
+// Autodiff 装饰器定义（crates/burn-autodiff/src/backend.rs）
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Autodiff<B, C = NoCheckpointing> {
+    _b: PhantomData<B>,
+    _checkpoint_strategy: PhantomData<C>,
+}
+
+impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
+    type InnerBackend = B;
+    type Gradients = Gradients;
+    
+    fn backward(tensor: AutodiffTensor<B>) -> Gradients {
+        tensor.backward()
+    }
+}
+```
+
+注意泛型参数 `C: CheckpointStrategy`——这对应于 §3.4 原文中提到的**检查点技术**：反向传播需保留前向传播的所有中间激活，内存与深度成比例增长。检查点技术通过仅存储部分层的激活、在反向传播时重新计算其余层来交换计算时间与内存 [Chen et al., 2016]。Burn 通过 `CheckpointStrategy` 泛型在编译期选择策略，默认 `NoCheckpointing` 保留所有激活。
+
 #### 进阶：链式法则
 
 Burn 通过 `Autodiff` 后端自动实现反向传播的链式法则。
@@ -963,6 +986,8 @@ let grads = loss.backward();
 1. **计算图跟踪**：`Autodiff<B>` 包装后端，记录所有张量操作
 2. **梯度计算**：调用 `backward()` 时，沿计算图反向传播梯度
 3. **雅可比矩阵乘积**：自动计算每个操作的雅可比矩阵与上游梯度的乘积
+
+正如原文所述，前向传播和反向传播的实现细节对程序员是隐藏的——深度学习框架能够自动构建计算梯度的操作序列。在 Burn 中，用户只需编写前向传播代码，`Autodiff` 自动处理一切。
 
 #### 专家：计算图构建与链式法则的具体应用
 
@@ -993,7 +1018,7 @@ fn relu_forward(x: Tensor) -> Tensor {
     x.maximum(0.0)
 }
 
-// ReLU 的反向传播
+// ReLU 的反向传播（框架内部自动生成，用户无需手动编写）
 fn relu_backward(grad_output: Tensor, x: Tensor) -> Tensor {
     let mask = x.greater_elem(0.0);  // ∂relu/∂x = 1 if x > 0 else 0
     grad_output * mask
@@ -1005,6 +1030,10 @@ fn relu_backward(grad_output: Tensor, x: Tensor) -> Tensor {
 $$
 \frac{\partial z}{\partial x} = y^T, \quad \frac{\partial z}{\partial y} = x^T
 $$
+
+**资源使用**：关于计算成本，线性操作前向传播需要一次矩阵乘积，反向传播需要两次（分别乘以 $\frac{\partial}{\partial x}$ 和 $\frac{\partial}{\partial y}$ 的雅可比矩阵），使得反向传播成本约为前向传播的两倍。存在通过可逆层 [Gomez et al., 2017] 或检查点技术（Burn 的 `CheckpointStrategy` 泛型）来交换内存和计算的方法。
+
+**视角转变**：深度学习成功的一个关键因素是不再试图改进通用优化方法，而是转向**设计模型本身以使其可优化**——这正是第 4-5 章中各种层设计（残差连接、归一化等）的核心动机。
 
 ---
 
@@ -1163,43 +1192,270 @@ impl<B: Backend> ConvNet<B> {
 
 > `#[derive(Module)]` 是 Burn 的核心设计：结构体字段自动成为可训练参数，`Module` trait 提供 `.to_device()`、`.no_grad()`、`.fork()` 等方法。层数越多，`forward` 中链式调用越长，直观映射了 §3.5 中"$D$ 个映射的组合"。
 
+#### 进阶：Module trait 的核心接口
+
+`#[derive(Module)]` 宏自动为结构体实现 `Module<B>` trait，该 trait 定义了深度学习模块的通用接口：
+
+**Burn 源代码**：`crates/burn-core/src/module/base.rs`
+
+```rust
+pub trait Module<B: Backend>: Clone + Send + Debug {
+    type Record: Record<B>;
+    
+    fn collect_devices(&self, devices: Devices<B>) -> Devices<B>; // 收集所有子模块所在设备
+    fn devices(&self) -> Devices<B>;                         // 获取模块所在设备列表
+    fn fork(self, device: &B::Device) -> Self;               // 克隆到指定设备（独立梯度图）
+    fn to_device(self, device: &B::Device) -> Self;          // 迁移到指定设备
+    fn no_grad(self) -> Self;                                // 冻结参数（不参与梯度计算）
+    fn num_params(&self) -> usize;                           // 可训练参数总数
+    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V);   // 只读遍历参数树
+    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self;// 变换参数树
+    fn into_record(self) -> Self::Record;                    // 转换为可序列化记录
+    fn load_record(self, record: Self::Record) -> Self;      // 从记录恢复
+}
+```
+
+> `visit()` 和 `map()` 是模块系统的基石——优化器通过 `map()` 对每个参数张量应用梯度更新，`num_params()` 内部通过 `visit()` 遍历并累加参数元素数量。
+
+训练时还需要 `AutodiffModule<B>` trait，提供训练/推理模式切换：
+
+```rust
+pub trait AutodiffModule<B: AutodiffBackend>: Module<B> + Send + Debug {
+    type InnerModule: Module<B::InnerBackend>;
+    
+    fn valid(&self) -> Self::InnerModule;   // 转为推理模式（去除 Autodiff 包装）
+}
+```
+
+**`#[derive(Module)]` 宏的工作原理**：
+- 结构体中实现了 `Module` 的字段自动被识别为子模块/参数
+- 自动生成 `visit()`/`map()` 的递归遍历逻辑（供优化器收集梯度使用）
+- 使用 `#[module(skip)]` 标注可跳过非参数字段（如配置、缓存等）
+
+#### 专家：Visitor/Mapper 模式与参数包装
+
+`Module` trait 通过访问者模式（Visitor Pattern）实现参数的统一遍历与变换。宏生成的代码为每个字段递归调用 `visit`/`map`：
+
+**Burn 源代码**：`crates/burn-core/src/module/base.rs`
+
+```rust
+// 只读访问器：遍历模块树中的所有参数张量
+pub trait ModuleVisitor<B: Backend> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {}
+    fn visit_int<const D: usize>(&mut self, param: &Param<Tensor<B, D, Int>>) {}
+    fn visit_bool<const D: usize>(&mut self, param: &Param<Tensor<B, D, Bool>>) {}
+    fn enter_module(&mut self, name: &str, container_type: &str) {}
+    fn exit_module(&mut self, name: &str, container_type: &str) {}
+}
+
+// 可变映射器：变换模块树中的所有参数张量（优化器通过此应用梯度）
+pub trait ModuleMapper<B: Backend> {
+    fn map_float<const D: usize>(
+        &mut self, param: Param<Tensor<B, D>>,
+    ) -> Param<Tensor<B, D>> { /* 默认返回原值 */ }
+    fn map_int<const D: usize>(
+        &mut self, param: Param<Tensor<B, D, Int>>,
+    ) -> Param<Tensor<B, D, Int>> { /* 默认返回原值 */ }
+    // ...
+}
+```
+
+参数张量被包装在 `Param<T>` 中，携带唯一 ID 和梯度开关：
+
+**Burn 源代码**：`crates/burn-core/src/module/param/base.rs`
+
+```rust
+pub struct Param<T: Parameter> {
+    pub id: ParamId,                       // 唯一标识符（优化器用此匹配梯度）
+    state: SyncOnceCell<T>,                // 延迟初始化的张量值
+    initialization: Option<...>,           // 惰性初始化配置
+    param_mapper: ParamMapper<T>,          // load/save 时的变换
+    pub(crate) require_grad: bool,         // 是否需要梯度
+}
+```
+
+宏生成的 `visit` 实现示例（展开后的等价代码）：
+
+```rust
+// #[derive(Module)] 为 ConvNet 生成的 visit 方法（简化）
+fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
+    visitor.enter_module("conv1", "Conv2d");
+    self.conv1.visit(visitor);        // 递归进入子模块
+    visitor.exit_module("conv1", "Conv2d");
+    visitor.enter_module("bn1", "BatchNorm");
+    self.bn1.visit(visitor);
+    visitor.exit_module("bn1", "BatchNorm");
+    // ... 对每个字段递归
+}
+```
+
+这一设计使得 `num_params()` 只需要一个简单的 visitor 实现即可统计全模型参数量，而优化器通过 `map()` 可以一次性对所有参数应用梯度更新——无需手动列举参数。
+
 ---
 
 ## 6. 训练协议（Training Protocols）
 
-### 6.1 数据集分割
+训练深度网络需要一整套协议，以充分利用计算和数据，确保模型在新数据上表现良好。正如 §3.6 所述，这至少需要三组互不相交的数据：**训练集**（优化参数）、**验证集**（调整超参数、监控过拟合）、**测试集**（最终评估）。完整训练分为多个 epoch，每个 epoch 遍历一次所有训练样本。损失的典型动态是：训练损失持续下降，而验证损失可能在若干 epoch 后到达最小值后回升——这反映了过拟合。
 
-Burn 提供了灵活的数据集 API。
+### 6.1 数据集与分割
+
+#### 入门：Dataset trait 与数据分割
+
+**Burn 源代码**：`crates/burn-dataset/src/dataset/base.rs`
+
+Burn 的数据集系统基于一个简洁的 trait：
+
+```rust
+pub trait Dataset<I>: Send + Sync {
+    fn get(&self, index: usize) -> Option<I>;   // 按索引获取样本
+    fn len(&self) -> usize;                      // 数据集大小
+    fn is_empty(&self) -> bool { self.len() == 0 }
+    fn iter(&self) -> DatasetIterator<'_, I>;    // 迭代器
+}
+```
+
+使用 `PartialDataset` 实现训练/验证分割：
 
 ```rust
 use burn::data::dataset::{
-    Dataset, 
-    transform::{PartialDataset, MapperDataset},
-    vision::MnistDataset
+    Dataset,
+    transform::PartialDataset,
+    vision::MnistDataset,
 };
+use std::sync::Arc;
 
-let dataset = Arc::new(MnistDataset::train());
-let train_dataset = PartialDataset::new(dataset.clone(), 0, 50000);
-let valid_dataset = PartialDataset::new(dataset.clone(), 50000, 60000);
+let dataset = Arc::new(MnistDataset::train());     // 60000 张手写数字图片
+let train_set = PartialDataset::new(dataset.clone(), 0, 50000);     // 前 50000 训练
+let valid_set = PartialDataset::new(dataset.clone(), 50000, 60000); // 后 10000 验证
+let test_set  = MnistDataset::test();              // 独立测试集（10000 张）
+```
+
+#### 进阶：数据集变换与数据源
+
+Burn 提供了丰富的数据集变换组合器（`crates/burn-dataset/src/transform/`），采用装饰器模式层层包装：
+
+| 变换 | 用途 | 示例 |
+|------|------|------|
+| `MapperDataset<D, M, I>` | 逐样本变换（归一化、增强） | 实现 `Mapper<I, O>` trait |
+| `ShuffledDataset<D, I>` | 随机打乱顺序 | `ShuffledDataset::with_seed(dataset, 42)` |
+| `SamplerDataset<D, I>` | 有/无放回采样 | 过采样少数类、控制 epoch 大小 |
+| `PartialDataset<D, I>` | 切片取子集 | 训练/验证分割 |
+
+```rust
+use burn::data::dataset::transform::{MapperDataset, Mapper};
+
+// 自定义数据变换：实现 Mapper trait
+struct NormalizeMapper;
+impl Mapper<RawItem, ProcessedItem> for NormalizeMapper {
+    fn map(&self, item: &RawItem) -> ProcessedItem {
+        ProcessedItem {
+            image: item.image.iter().map(|&v| v as f32 / 255.0).collect(),
+            label: item.label,
+        }
+    }
+}
+
+let normalized = MapperDataset::new(dataset, NormalizeMapper);
+```
+
+**数据源**：除了内存数据集 `InMemDataset`（支持 JSON/CSV 加载），Burn 还提供：
+- `SqliteDataset`：基于 SQLite 的大规模数据集，支持懒加载
+- `HuggingfaceDatasetLoader`：直接从 Hugging Face Hub 下载数据集
+
+```rust
+use burn::data::dataset::source::huggingface::HuggingfaceDatasetLoader;
+
+let dataset: SqliteDataset<TextItem> = HuggingfaceDatasetLoader::new("ag_news")
+    .dataset("train")
+    .unwrap();
 ```
 
 ### 6.2 数据加载器
 
+DataLoader 负责将数据集样本组装为 mini-batch 并送入模型。§3.3 中提到 SGD 的核心思想是每次只用一部分数据估计梯度——DataLoader 正是实现这一机制的组件。
+
 ```rust
 use burn::data::dataloader::DataLoaderBuilder;
 
-let dataloader = DataLoaderBuilder::new(batcher)
+let dataloader_train = DataLoaderBuilder::new(batcher)
+    .batch_size(64)           // mini-batch 大小
+    .shuffle(42)              // 每个 epoch 随机打乱
+    .num_workers(4)           // 多线程预加载
+    .build(train_set);
+
+let dataloader_valid = DataLoaderBuilder::new(batcher)
     .batch_size(64)
-    .shuffle(42)
-    .num_workers(4)
-    .build(dataset);
+    .build(valid_set);        // 验证集不需要 shuffle
 ```
 
-### 6.3 训练循环与评估
+> `Batcher` trait 定义了如何将单个样本组装为 batch tensor。通常需要实现 `Batcher<B, Item, Batch>` 对原始数据进行 padding、归一化等预处理。
 
-Burn 提供了 `SupervisedTraining` Builder 作为高级训练入口，`Learner` 封装模型 + 优化器 + 调度器。
+### 6.3 训练循环（TrainStep / InferenceStep）
 
-**Burn 源代码**：`crates/burn-train/src/learner/base.rs`，`examples/mnist/src/training.rs`
+#### 入门：定义训练和验证步骤
+
+模型需要实现 `TrainStep`（训练步）和 `InferenceStep`（验证/推理步）两个 trait：
+
+**Burn 源代码**：`crates/burn-train/src/learner/train_val.rs`
+
+```rust
+pub trait TrainStep {
+    type Input: Send + 'static;
+    type Output: ItemLazy + 'static;
+    
+    fn step(&self, item: Self::Input) -> TrainOutput<Self::Output>;
+}
+
+pub trait InferenceStep {
+    type Input: Send + 'static;
+    type Output: ItemLazy + 'static;
+    
+    fn step(&self, item: Self::Input) -> Self::Output;
+}
+```
+
+实现示例（以 MNIST 分类为例）：
+
+```rust
+impl<B: AutodiffBackend> TrainStep for Model<B> {
+    type Input = MnistBatch<B>;
+    type Output = ClassificationOutput<B>;
+    
+    fn step(&self, batch: MnistBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        let output = self.forward(batch.images, batch.targets.clone());
+        let loss = output.loss.clone();
+        // backward() 计算梯度，返回 TrainOutput 供优化器使用
+        TrainOutput::new(self, loss.backward(), output)
+    }
+}
+
+impl<B: Backend> InferenceStep for Model<B> {
+    type Input = MnistBatch<B>;
+    type Output = ClassificationOutput<B>;
+    
+    fn step(&self, batch: MnistBatch<B>) -> ClassificationOutput<B> {
+        self.forward(batch.images, batch.targets)  // 推理模式：不计算梯度
+    }
+}
+```
+
+#### 进阶：SupervisedTraining 与 Learner
+
+`SupervisedTraining` 是完整训练流程的 Builder，`Learner` 封装模型 + 优化器 + 学习率调度器。
+
+**Burn 源代码**：`crates/burn-train/src/learner/supervised/paradigm.rs`，`crates/burn-train/src/learner/base.rs`
+
+```rust
+// Learner 封装训练的三个核心组件
+pub struct Learner<LC: LearningComponentsTypes> {
+    model: LC::TrainingModel,       // 模型
+    optim: LC::Optimizer,           // 优化器
+    lr_scheduler: LC::LrScheduler,  // 学习率调度器
+    lr: f64,                        // 当前学习率
+}
+```
+
+完整训练流程示例：
 
 ```rust
 use burn::{
@@ -1216,10 +1472,14 @@ use burn::{
 
 static ARTIFACT_DIR: &str = "/tmp/burn-model";
 
-// SupervisedTraining 是训练流程的 Builder
-let training = SupervisedTraining::new(ARTIFACT_DIR, dataloader_train, dataloader_valid)
-    .metrics((AccuracyMetric::new(), LossMetric::new()))  // 追踪指标
-    .early_stopping(MetricEarlyStoppingStrategy::new(     // 早停策略
+// SupervisedTraining Builder：配置整个训练过程
+let training = SupervisedTraining::new(
+        ARTIFACT_DIR,
+        dataloader_train,       // 训练集 DataLoader
+        dataloader_valid,       // 验证集 DataLoader
+    )
+    .metrics((AccuracyMetric::new(), LossMetric::new()))   // 追踪准确率和损失
+    .early_stopping(MetricEarlyStoppingStrategy::new(      // 早停策略（见 §6.4）
         &LossMetric::<B>::new(),
         Aggregate::Mean,
         Direction::Lowest,
@@ -1230,76 +1490,221 @@ let training = SupervisedTraining::new(ARTIFACT_DIR, dataloader_train, dataloade
     .num_epochs(10)
     .summary();
 
-// Learner::new(model, optimizer, lr_scheduler)
+// launch() 启动训练循环，内部每个 epoch：
+//   1. 遍历训练 DataLoader → model.step(batch) → backward → optimizer.step
+//   2. 遍历验证 DataLoader → model.valid().step(batch) → 计算指标
+//   3. 检查早停条件、保存检查点、更新学习率
 let result = training.launch(Learner::new(
     model,
     AdamWConfig::new().init(),
     lr_scheduler,
 ));
 
-let trained_model = result.model;  // 训练后的模型
+let trained_model = result.model;
 ```
 
-### 6.4 早停（Early Stopping）
+### 6.4 指标系统（Metrics）
 
-`MetricEarlyStoppingStrategy`（`crates/burn-train/src/learner/early_stopping.rs`）实现 `EarlyStoppingStrategy` trait，通过 `.early_stopping()` 传入 `SupervisedTraining`：
+Burn 的指标系统通过 `Metric` trait 和 `Adaptor` trait 实现解耦——模型输出只需实现 `Adaptor` 即可对接任意指标。
+
+**Burn 源代码**：`crates/burn-train/src/metric/base.rs`
 
 ```rust
-// EarlyStoppingStrategy trait 定义
+pub trait Metric: Send + Sync + Clone {
+    type Input;
+    fn name(&self) -> MetricName;
+    fn update(&mut self, item: &Self::Input, metadata: &MetricMetadata) -> SerializedEntry;
+    fn clear(&mut self);
+}
+
+// Adaptor 将模型输出转换为指标输入，实现解耦
+pub trait Adaptor<T> {
+    fn adapt(&self) -> T;
+}
+```
+
+内置指标包括 `AccuracyMetric`、`LossMetric`、`TopKAccuracyMetric`、`CpuUse`、`CpuMemory`、`CudaMetric` 等。`MetricMetadata` 还提供当前学习率（`lr`）和训练进度信息。
+
+### 6.5 早停（Early Stopping）
+
+§3.6 指出验证损失可能在若干 epoch 后开始回升（过拟合），早停策略可以在这种情况下自动终止训练。
+
+**Burn 源代码**：`crates/burn-train/src/learner/early_stopping.rs`
+
+```rust
 pub trait EarlyStoppingStrategy: Send {
     fn should_stop(&mut self, epoch: usize, store: &EventStoreClient) -> bool;
 }
 
-// 构造早停策略：监控指标 + 聚合方式 + 方向 + 数据集 + 停止条件
+// 基于指标的早停：监控指标 + 聚合方式 + 方向 + 数据集 + 停止条件
 let early_stopping = MetricEarlyStoppingStrategy::new(
     &LossMetric::<B>::new(),
     Aggregate::Mean,        // 对 batch 取均值
-    Direction::Lowest,      // 越低越好（分类准确率用 Direction::Highest）
-    Split::Valid,           // 监控验证集（不是训练集）
-    StoppingCondition::NoImprovementSince { n_epochs: 5 },
+    Direction::Lowest,      // 损失越低越好（准确率用 Direction::Highest）
+    Split::Valid,           // 监控验证集（而非训练集）
+    StoppingCondition::NoImprovementSince { n_epochs: 5 },  // 5个 epoch 无改善即停止
 );
-// 通过 .early_stopping(early_stopping) 挂入 SupervisedTraining（见上方 §6.3）
+```
+
+### 6.6 微调（Fine-tuning）
+
+§3.6 强调微调是将预训练模型适配到下游任务的核心手段——特别是当下游任务数据有限时，预训练模型编码的统计结构提供了良好的归纳偏置。在 Burn 中通过 `load_record` 加载预训练权重，然后用 `no_grad()` 选择性冻结部分层：
+
+```rust
+// 1. 加载预训练模型权重
+let pretrained_record = CompactRecorder::new()
+    .load::<ModelRecord<B>>(pretrained_path, &device)
+    .unwrap();
+let model = ModelConfig::new().init(&device).load_record(pretrained_record);
+
+// 2. 冻结特征提取层，只训练分类头（迁移学习）
+// no_grad() 使该子模块的参数不参与梯度计算
+let model = Model {
+    backbone: model.backbone.no_grad(),   // 冻结
+    classifier: model.classifier,          // 可训练
+};
+
+// 3. 使用较小的学习率微调
+let lr_scheduler = CosineAnnealingLrSchedulerConfig::new(1e-5, num_iters).init();
 ```
 
 ---
 
 ## 7. 规模的好处（The Benefit of Scale）
 
+§3.7 指出性能随数据量和模型规模的增加而提高，遵循显著的缩放定律 [Kaplan et al., 2020]。受益于这些缩放定律部分归功于深度模型可以通过增加层数或特征维度任意扩展，也归功于 SGD 一次只需要一部分数据——可以处理远超设备内存的数据集。典型视觉模型有 $10^7 - 10^8$ 个参数（$10^{18} - 10^{19}$ FLOPs），大型语言模型有 $10^8 - 10^{11}$ 个参数（$10^{20} - 10^{23}$ FLOPs），后者需要多 GPU 集群。
+
 ### 7.1 多后端支持
 
-Burn 支持多种硬件后端，便于在不同规模上训练和部署。
+#### 入门：选择计算后端
+
+Burn 的核心设计是**后端无关**——模型代码不绑定任何特定硬件。通过泛型参数 `B: Backend` 在编译期选择后端，同一份代码可以在 CPU、GPU、浏览器中运行。
 
 ```rust
-// CPU 后端
-use burn_ndarray::NdArray;
-type CpuBackend = NdArray<f32>;
+use burn::backend::{Autodiff, NdArray, Wgpu};
 
-// GPU 后端
-use burn_wgpu::Wgpu;
-type GpuBackend = Wgpu;
+// 开发调试：纯 Rust CPU 后端（无外部依赖）
+type DevBackend = NdArray;
+type DevTrainBackend = Autodiff<DevBackend>;
 
-// CUDA 后端
-use burn_cuda::Cuda;
-type CudaBackend = Cuda;
+// 生产训练：GPU 后端
+type ProdBackend = Wgpu;
+type ProdTrainBackend = Autodiff<ProdBackend>;
 
-// 自动微分包装
-type TrainBackend = Autodiff<CudaBackend>;
+// 同一个函数签名，不同后端直接切换
+fn train<B: AutodiffBackend>(device: &B::Device) { /* ... */ }
+
+train::<DevTrainBackend>(&NdArrayDevice::Cpu);
+train::<ProdTrainBackend>(&WgpuDevice::default());
 ```
 
-### 7.2 分布式训练
+#### 进阶：Backend trait 架构
 
-Burn 通过 `burn_collective` 支持分布式训练。
+**Burn 源代码**：`crates/burn-backend/src/backend/base.rs`
+
+所有后端实现统一的 `Backend` trait，定义了张量类型和操作接口：
 
 ```rust
-use burn_collective::{
-    init_process_group,
-    all_reduce,
-    Backend as CollectiveBackend
-};
-
-init_process_group(backend, rank, world_size);
-let reduced_grads = all_reduce(grads, CollectiveBackend::Nccl);
+pub trait Backend:
+    FloatTensorOps<Self>     // 浮点张量操作（matmul, exp, log 等）
+    + IntTensorOps<Self>     // 整数张量操作
+    + BoolTensorOps<Self>    // 布尔张量操作
+    + ModuleOps<Self>        // 模块操作（conv, pool, embedding 等）
+    + ActivationOps<Self>    // 激活函数（relu, gelu, sigmoid 等）
+    + QTensorOps<Self>       // 量化张量操作
+    + TransactionOps<Self>   // 批量操作事务
+    + Clone + Default + Send + Sync + 'static
+{
+    type Device: DeviceOps;                              // 设备类型
+    type FloatTensorPrimitive: TensorMetadata + 'static; // 浮点张量原语
+    type FloatElem: Element;                             // 浮点元素类型
+    type IntTensorPrimitive: TensorMetadata + 'static;   // 整数张量原语
+    type IntElem: Element;                               // 整数元素类型
+    // ...
+}
 ```
+
+**可用后端一览**：
+
+| Crate | 类型 | 适用场景 | 特点 |
+|-------|------|----------|------|
+| `burn-ndarray` | CPU | 开发调试、嵌入式部署 | 纯 Rust，零外部依赖 |
+| `burn-wgpu` | GPU | 跨平台 GPU 训练/推理 | WebGPU（Vulkan/Metal/DX12） |
+| `burn-cuda` | GPU | NVIDIA GPU 训练 | CUDA 原生，最高性能 |
+| `burn-rocm` | GPU | AMD GPU 训练 | ROCm 支持 |
+| `burn-tch` | GPU | 需要 LibTorch 生态 | PyTorch C++ 后端绑定 |
+| `burn-candle` | GPU | Hugging Face 生态 | Candle 后端绑定 |
+
+**装饰器后端**（包装其他后端添加功能）：
+
+| Crate | 功能 | 用法 |
+|-------|------|------|
+| `burn-autodiff` | 自动微分 | `Autodiff<B>` / `Autodiff<B, BalancedCheckpointing>` |
+| `burn-fusion` | 算子融合优化 | 自动合并连续操作减少内存传输 |
+
+### 7.2 Autodiff 装饰器的类型系统
+
+`Autodiff<B, C>` 的精妙之处在于它本身也实现了 `Backend`——可以作为泛型参数传入任何接受 `B: Backend` 的函数，同时额外实现 `AutodiffBackend` 提供梯度计算能力：
+
+**Burn 源代码**：`crates/burn-autodiff/src/backend.rs`
+
+```rust
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Autodiff<B, C = NoCheckpointing> {
+    _b: PhantomData<B>,
+    _checkpoint_strategy: PhantomData<C>,
+}
+
+// Autodiff<B> 本身就是 Backend——可以无缝传入任何泛型函数
+impl<B: Backend, C: CheckpointStrategy> Backend for Autodiff<B, C> {
+    type Device = B::Device;                        // 设备类型透传
+    type FloatTensorPrimitive = AutodiffTensor<B>;  // 浮点张量包装为计算图节点
+    type IntTensorPrimitive = B::IntTensorPrimitive;// 整数/布尔张量无需梯度，直接透传
+    // ...
+}
+
+impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
+    type InnerBackend = B;         // 解包后回到原始后端
+    type Gradients = Gradients;
+    
+    fn backward(tensor: AutodiffTensor<B>) -> Gradients;         // 反向传播
+    fn grad(tensor: &AutodiffTensor<B>, grads: &Gradients)       // 读取梯度
+        -> Option<B::FloatTensorPrimitive>;
+    fn inner(tensor: AutodiffTensor<B>) -> B::FloatTensorPrimitive; // 解包获取内部张量
+}
+```
+
+> 这种设计意味着 `Autodiff<Wgpu>` 的 `Device` 就是 `WgpuDevice`，整数和布尔张量直接透传给内部后端——只有浮点张量被包装进计算图以追踪梯度。推理时通过 `model.valid()` 去除 `Autodiff` 包装，回到纯 `Wgpu` 后端，无任何额外开销。
+
+### 7.3 分布式训练
+
+大规模训练需要多设备并行。Burn 通过 `burn-collective` crate 提供集合通信原语，支持梯度同步：
+
+**Burn 源代码**：`crates/burn-collective/src/api.rs`
+
+```rust
+use burn_collective::{register, all_reduce, ReduceOperation, PeerId, CollectiveConfig};
+
+// 1. 注册当前进程到通信组
+register::<B>(peer_id, device, config)?;
+
+// 2. 全局梯度聚合（All-Reduce）
+// 每个设备计算局部梯度 → all_reduce 同步求和/平均 → 所有设备获得一致的全局梯度
+let synced_grads = all_reduce::<B>(peer_id, local_grads, ReduceOperation::Sum)?;
+
+// 3. 广播（从一个节点向所有节点发送）
+let weights = broadcast::<B>(peer_id, if is_root { Some(tensor) } else { None })?;
+```
+
+`burn-communication` crate 提供底层通信协议抽象（`Protocol` trait），目前支持 WebSocket 通信通道，使得分布式训练不依赖 NCCL 等 GPU 专属库。
+
+#### 专家：规模化训练的实践考量
+
+**梯度累积**：当单 GPU 内存不足以容纳大 batch 时，可通过 `SupervisedTraining` 的 `.grad_accumulation(n)` 方法模拟更大的 batch size——累积 $n$ 个 mini-batch 的梯度后再执行一次参数更新。
+
+**模型参数量估算**：`model.num_params()` 通过 Visitor 模式遍历所有 `Param<Tensor>` 的元素数量求和。对于 f32 模型，内存占用约为 $\text{params} \times 4$ 字节；训练时需额外存储梯度和优化器状态，总内存约为推理的 3-4 倍。
+
+**混合精度**：通过后端的 `supports_dtype()` 和 `dtype_usage()` 方法查询设备对不同精度的支持情况，在性能和精度之间取得平衡。
 
 ---
 
