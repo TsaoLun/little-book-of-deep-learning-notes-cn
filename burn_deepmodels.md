@@ -145,22 +145,66 @@ pub fn linear<B: Backend, const D: usize>(
 }
 ```
 
-#### 专家：初始化策略与布局优化
+#### 专家：初始化策略、梯度计算与性能优化
 
-**初始化配置**：`crates/burn-core/src/module/initializer.rs`
+**1. 初始化策略的数学原理**
+
+线性层的初始化策略旨在防止训练初期的梯度消失或爆炸问题。Burn 通过 `Initializer` 枚举提供多种初始化方法，每种对应不同的数学假设：
+
 ```rust
 pub enum Initializer {
-    Constant { value: f64 },
-    Uniform { min: f64, max: f64 },
-    Normal { mean: f64, std: f64 },
-    KaimingUniform { gain: f64, fan_out_only: bool },
-    KaimingNormal { gain: f64, fan_out_only: bool },
-    XavierUniform { gain: f64 },
-    XavierNormal { gain: f64 },
+    Constant { value: f64 },                     // 常数初始化
+    Uniform { min: f64, max: f64 },             // 均匀分布 U(a,b)
+    Normal { mean: f64, std: f64 },             // 正态分布 N(μ,σ²)
+    KaimingUniform { gain: f64, fan_out_only: bool },  // He 初始化（均匀）
+    KaimingNormal { gain: f64, fan_out_only: bool },   // He 初始化（正态）
+    XavierUniform { gain: f64 },                // Xavier/Glorot 初始化（均匀）
+    XavierNormal { gain: f64 },                 // Xavier/Glorot 初始化（正态）
 }
 ```
 
-**布局优化**：`LinearLayout` 枚举支持行优先（Row）和列优先（Col）存储，影响矩阵乘法性能。
+**关键初始化公式**：
+- **Xavier/Glorot 初始化**：$\sigma = \text{gain} \times \sqrt{\frac{2}{n_{\text{in}} + n_{\text{out}}}}$，适用于 tanh/sigmoid 激活
+- **Kaiming/He 初始化**：$\sigma = \text{gain} \times \sqrt{\frac{2}{n_{\text{in}}}}$，适用于 ReLU 及其变体
+
+**2. 自动微分与梯度计算**
+
+线性层 $Y = XW + b$ 的前向传播简单，但反向传播需要计算三个梯度：
+- $\frac{\partial L}{\partial X} = \frac{\partial L}{\partial Y} W^\top$（输入梯度）
+- $\frac{\partial L}{\partial W} = X^\top \frac{\partial L}{\partial Y}$（权重梯度）
+- $\frac{\partial L}{\partial b} = \sum_{\text{batch}} \frac{\partial L}{\partial Y}$（偏置梯度）
+
+Burn 的自动微分后端通过 `matmul` 操作的梯度规则实现这些计算。`Tensor::matmul()` 在 `Autodiff<B>` 后端下会自动注册反向传播函数，计算上述梯度。
+
+**3. 性能优化与底层实现**
+
+线性层的性能关键在矩阵乘法（GEMM）优化。Burn 的后端系统允许不同硬件平台实现优化的 `matmul`：
+
+- **CPU 后端**：使用 BLAS 库（如 OpenBLAS、Intel MKL）的 `sgemm`/`dgemm` 函数
+- **GPU 后端**：调用 cuBLAS（NVIDIA）或 rocBLAS（AMD）的批处理 GEMM
+- **WASM 后端**：使用 SIMD 优化的 JavaScript 实现
+
+**内存布局优化**：`LinearLayout` 枚举支持行优先（C 风格）和列优先（Fortran 风格）存储：
+```rust
+pub enum LinearLayout {
+    Row,  // 内存连续存储行元素
+    Col,  // 内存连续存储列元素
+}
+```
+
+选择合适布局可以避免转置开销，直接匹配后端 BLAS 库的期望格式。
+
+**4. 数值稳定性考量**
+
+虽然线性层本身没有 softmax 那样的数值溢出风险，但大规模矩阵乘法仍需要注意：
+
+- **混合精度训练**：使用 `f16` 或 `bf16` 可减少内存占用和加速计算，但需注意精度损失和溢出风险
+- **梯度裁剪**：大权重矩阵可能导致梯度爆炸，需在优化器中设置梯度裁剪
+- **条件数**：权重矩阵的条件数 $\kappa(W) = \|W\| \cdot \|W^{-1}\|$ 影响数值稳定性，正交初始化有助于保持条件数接近 1
+
+**5. 与 §3.3 的联系**
+
+线性层作为最基本的可训练模块，其梯度计算直接体现了 §3.3 中 SGD 的核心思想：$\theta \leftarrow \theta - \eta \nabla_\theta L$。优化器通过 `ModuleVisitor` 遍历线性层的 `Param<Weight>` 和 `Param<Bias>`，应用计算得到的梯度更新参数。
 
 ---
 
@@ -215,15 +259,71 @@ impl<B: Backend, const D: usize> Conv<B, D> {
 }
 ```
 
-#### 专家：卷积变体与性能优化
+#### 专家：卷积算法、梯度计算与性能优化
 
-**卷积变体**：
-- **转置卷积**（Transposed Convolution）：`ConvTranspose1d`, `ConvTranspose2d`, `ConvTranspose3d`
-- **空洞卷积**（Dilated Convolution）：通过 `dilation` 参数控制
-- **分组卷积**（Grouped Convolution）：通过 `groups` 参数控制
+**1. 卷积算法的实现策略**
 
-**感受野计算**：
-对于输入大小 $T$，核大小 $K$，步幅 $S$，填充 $P$，输出大小 $T' = \frac{T + 2P - K}{S} + 1$
+卷积操作的计算复杂度高（$O(B \cdot C_{\text{in}} \cdot C_{\text{out}} \cdot H \cdot W \cdot K \cdot L)$），因此 Burn 后端采用多种优化策略：
+
+- **im2col + GEMM**：将卷积展开为大型矩阵乘法，利用 BLAS 库的优化 GEMM 函数
+  ```rust
+  // 概念性伪代码
+  let im2col = input.im2col(kernel_size, stride, padding, dilation);
+  let output = im2col.matmul(weight.reshape([C_out, C_in * K * L]));
+  ```
+- **Winograd 算法**：对小型核（3×3）使用 Winograd 变换减少乘法次数
+- **FFT 卷积**：对大型核使用快速傅里叶变换，将时域卷积转为频域点乘
+
+**2. 自动微分与梯度计算**
+
+卷积操作的反向传播需要计算三个梯度：
+
+- **输入梯度**：$\frac{\partial L}{\partial X} = \text{conv2d\_transpose}(\frac{\partial L}{\partial Y}, W, \text{stride}, \text{padding}, \text{dilation})$
+- **权重梯度**：$\frac{\partial L}{\partial W} = \text{conv2d}(X, \frac{\partial L}{\partial Y}, \text{stride}, \text{padding}, \text{dilation})$
+- **偏置梯度**：$\frac{\partial L}{\partial b} = \sum_{b,h,w} \frac{\partial L}{\partial Y_{b,c,h,w}}$
+
+Burn 的 `Autodiff` 后端为 `convolution` 操作注册自定义梯度函数，实现上述计算。
+
+**3. 卷积变体与扩展**
+
+- **转置卷积（反卷积）**：`ConvTransposeNd` 实现上采样，常用于生成模型和分割网络
+  - 数学上等价于在输入间插入零的常规卷积
+- **空洞卷积**：`dilation > 1` 增大感受野而不增加参数，用于多尺度特征提取
+- **分组卷积**：`groups > 1` 将通道分组独立处理，减少参数和计算量
+  - 极端情况 `groups = C_in = C_out` 为深度可分离卷积
+- **可变形卷积**：通过学习偏移量使采样位置自适应内容
+
+**4. 性能优化技术**
+
+- **内存布局**：NHWC（通道最后）与 NCHW（通道优先）布局对 GPU/CPU 性能影响不同
+- **核融合**：将卷积 + 批归一化 + 激活函数融合为单个 GPU 核函数，减少内存传输
+- **张量核心**：利用 NVIDIA Tensor Cores 进行混合精度（fp16/bf16）卷积
+- **分组卷积优化**：对 `groups > 1` 使用专门的核函数避免冗余计算
+
+**5. 数值稳定性与精度**
+
+- **整数卷积**：对量化模型使用整数卷积，需注意累加溢出问题
+- **混合精度训练**：使用 fp16 权重但 fp32 累加器防止精度损失
+- **梯度裁剪**：深层卷积网络易出现梯度爆炸，需在优化器设置梯度裁剪
+
+**6. 感受野计算与特征图尺寸**
+
+对于 D 维卷积：
+$$
+T' = \frac{T + 2P - K - (K-1)(D-1)}{S} + 1
+$$
+其中 $D$ 为膨胀率（dilation）。感受野大小 $R$ 与层数 $L$、核大小 $K$、膨胀率 $D$、步幅 $S$ 的关系为：
+$$
+R_L = 1 + \sum_{l=1}^{L} (K_l - 1) \times D_l \times \prod_{i=1}^{l-1} S_i
+$$
+
+**7. 与 §4.6 归一化层的联系**
+
+卷积层常后接批归一化层（§4.6），训练时可分别更新，推理时可将批归一化参数（$\gamma, \beta$）融合到卷积权重中：
+$$
+W_{\text{fused}} = \gamma \cdot W, \quad b_{\text{fused}} = \gamma \cdot b + \beta
+$$
+这种融合减少推理时的计算量和内存访问。
 
 ---
 
@@ -586,20 +686,85 @@ impl<B: Backend> MultiHeadAttention<B> {
 }
 ```
 
-#### 专家：注意力变体与优化
+#### 专家：注意力机制、梯度计算与高效实现
 
-**注意力变体**：
-- **缩放点积注意力**：标准 Transformer 注意力
-- **因果注意力**：使用下三角掩码防止信息泄漏
-- **局部注意力**：限制注意力窗口大小以减少计算
-- **稀疏注意力**：仅计算部分注意力分数
+**1. 注意力机制的数学细节**
 
-**计算复杂度**：标准注意力 $O(n^2 d)$，线性注意力 $O(nd^2)$。
+标准缩放点积注意力的数学形式为：
+$$
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+$$
 
-**掩码类型**：
-- **填充掩码**：忽略填充令牌
-- **因果掩码**：自回归生成
-- **滑动窗口掩码**：局部注意力
+- **缩放因子** $\frac{1}{\sqrt{d_k}}$：防止点积值过大导致 softmax 梯度消失
+- **softmax 温度**：可引入温度参数 $\tau$：$\text{softmax}(x/\tau)$，控制注意力分布尖锐程度
+- **注意力稀疏性**：可通过 top-k 筛选或稀疏 softmax 减少计算
+
+**2. 自动微分与梯度计算**
+
+注意力层包含三个可微操作：矩阵乘法、缩放、softmax、第二个矩阵乘法。
+
+- **softmax 梯度**：若 $y = \text{softmax}(x)$，则 $\frac{\partial y_i}{\partial x_j} = y_i(\delta_{ij} - y_j)$
+- **整体梯度流**：$\frac{\partial L}{\partial Q} = \frac{\partial L}{\partial \text{Attention}} \cdot \frac{\partial \text{Attention}}{\partial Q}$ 等
+
+Burn 的自动微分后端将注意力分解为基本操作，分别计算梯度后组合。
+
+**3. 高效注意力实现技术**
+
+标准注意力 $O(n^2 d)$ 复杂度对长序列不可行，需优化：
+
+- **FlashAttention** [Dao et al., 2022]：通过分块计算和重计算避免存储 $n \times n$ 注意力矩阵
+  ```rust
+  // 概念性伪代码
+  fn flash_attention(q, k, v, block_size) {
+      for i in 0..n/block_size {
+          for j in 0..n/block_size {
+              // 分块计算注意力分数
+              let scores = q_block[i].matmul(k_block[j].t());
+              // 在线 softmax（数值稳定）
+              let attn = online_softmax(scores);
+              output_block[i] += attn.matmul(v_block[j]);
+          }
+      }
+  }
+  ```
+- **内存高效注意力**：通过重计算中间结果减少内存占用
+- **线性注意力**：使用核函数近似，复杂度 $O(nd^2)$
+  $$ \text{LinearAttn}(Q, K, V) = \phi(Q)(\phi(K)^\top V) $$
+  其中 $\phi$ 为特征映射（如 $\phi(x) = \text{elu}(x) + 1$）
+
+**4. 注意力变体与掩码机制**
+
+- **因果注意力**（自回归）：使用下三角布尔掩码 $M_{ij} = \begin{cases} 0 & i \geq j \\ -\infty & i < j \end{cases}$
+- **局部注意力**：滑动窗口掩码 $M_{ij} = \begin{cases} 0 & |i-j| \leq w \\ -\infty & \text{否则} \end{cases}$
+- **跨步注意力**：稀疏模式减少计算，如 BigBird 的全局+局部+随机注意力
+
+**5. 数值稳定性考量**
+
+注意力层的数值稳定性关键在 softmax：
+- **在线 softmax**：分块计算时需维护 running max 和 sum 保证数值稳定
+- **混合精度**：使用 fp16 计算但 fp32 累加器，防止下溢
+- **梯度裁剪**：注意力分数可能产生极大梯度，需裁剪
+
+**6. 多头注意力的并行化**
+
+- **张量并行**：将头分配到不同设备，通过 all-gather 通信合并结果
+- **序列并行**：将序列分块分配到不同设备，需要跨设备通信注意力分数
+- **流水线并行**：将注意力层分配到不同设备，需要激活 checkpointing
+
+**7. 与 §4.7 跳跃连接的联系**
+
+Transformer 块中，注意力层通常与残差连接（§4.7）和层归一化（§4.6）结合：
+$$
+\text{Output} = \text{LayerNorm}(x + \text{Attention}(x))
+$$
+残差连接确保梯度直接回传，缓解梯度消失。
+
+**8. 计算复杂度分析**
+
+设序列长度 $n$，隐藏维度 $d$，头数 $h$：
+- **标准注意力**：$O(n^2 d + nd^2)$（注意力 + 投影）
+- **线性注意力**：$O(nd^2)$（无 $n^2$ 项）
+- **内存占用**：标准注意力需存储 $n \times n$ 矩阵（$O(n^2)$），优化版本可降至 $O(n)$
 
 ---
 
@@ -954,15 +1119,29 @@ impl<B: Backend> TransformerEncoderLayer<B> {
 }
 ```
 
-#### 专家：Transformer 变体与优化
+#### 专家：Transformer 架构设计、训练与优化
 
-**Transformer 变体**：
-- **原始 Transformer**：编码器-解码器架构，用于序列到序列任务
-- **BERT**：仅编码器，双向上下文，MLM 预训练
-- **GPT**：仅解码器，自回归生成，CLM 预训练
-- **T5**：编码器-解码器，文本到文本统一框架
+**1. Transformer 架构设计原理**
 
-**前馈网络实现**：
+Transformer 的核心设计选择及其数学原理：
+
+- **残差连接**（§4.7）：$x_{l+1} = x_l + F(x_l)$ 确保梯度直接回传，缓解梯度消失
+- **层归一化**（§4.6）：在残差连接前归一化（Pre-LN）或后归一化（Post-LN），影响训练稳定性
+- **缩放注意力**：$\frac{QK^\top}{\sqrt{d_k}}$ 防止点积值过大导致 softmax 饱和
+- **前馈网络**：两层线性变换 + 激活函数，提供非线性容量
+
+**2. 主要 Transformer 变体**
+
+| 变体 | 架构 | 预训练目标 | 应用 |
+|------|------|------------|------|
+| **原始 Transformer** | 编码器-解码器 | 序列到序列 | 机器翻译 |
+| **BERT** | 仅编码器 | 掩码语言建模 (MLM) | 文本分类、NER |
+| **GPT** | 仅解码器 | 因果语言建模 (CLM) | 文本生成 |
+| **T5** | 编码器-解码器 | 文本到文本 | 多任务学习 |
+
+**3. 前馈网络实现细节**
+
+前馈网络（FFN）是 Transformer 的关键组件，提供非线性变换：
 ```rust
 #[derive(Module, Debug)]
 struct FeedForward<B: Backend> {
@@ -981,31 +1160,82 @@ impl<B: Backend> FeedForward<B> {
 }
 ```
 
-**位置编码集成**：
-```rust
-struct TransformerInput<B: Backend> {
-    embeddings: Tensor<B, 3>,      // 令牌嵌入
-    mask_attn: Option<Tensor<B, 2, Bool>>,  // 注意力掩码
-    mask_padding: Option<Tensor<B, 2, Bool>>, // 填充掩码
-}
+**激活函数选择**：
+- **GELU**：$x \Phi(x)$，其中 $\Phi$ 为标准正态 CDF，平滑近似 ReLU
+- **Swish**：$x \cdot \sigma(\beta x)$，可学习平滑度参数
+- **ReLU**：计算简单但输出非零均值
 
-impl<B: Backend> TransformerEncoder<B> {
-    fn forward(&self, input: TransformerInput<B>) -> Tensor<B, 3> {
-        let mut x = input.embeddings;
-        
-        // 添加位置编码
-        x = self.pos_encoding.forward(x);
-        x = self.dropout.forward(x);
-        
-        // 通过编码器层
-        for layer in &self.layers {
-            x = layer.forward(x, input.mask_attn.clone());
-        }
-        
-        x
-    }
-}
-```
+**4. 位置编码策略**
+
+位置编码使模型感知序列顺序：
+
+- **绝对位置编码**：正弦/余弦函数（原始 Transformer）或可学习嵌入
+  ```rust
+  fn sinusoidal_pos_encoding(seq_len: usize, d_model: usize) -> Tensor<B, 2> {
+      let positions = Tensor::arange(0..seq_len);
+      let dimensions = Tensor::arange(0..d_model);
+      let angles = positions.unsqueeze(1) / (10000.0.pow(dimensions / d_model));
+      angles.sin() // 偶索引
+          .masked_fill(dimensions % 2 == 1, angles.cos())  // 奇索引
+  }
+  ```
+- **相对位置编码**：注意力分数中加入相对位置偏置 $B_{i-j}$
+- **旋转位置编码**：RoPE，通过旋转矩阵编码相对位置
+
+**5. Transformer 训练技巧**
+
+- **学习率预热**：前 $w$ 步线性增加学习率至初始值，稳定训练初期
+  $$ \eta_t = \frac{t}{w} \cdot \eta_{\text{max}}, \quad t < w $$
+- **权重衰减**：L2 正则化防止过拟合，通常设置为 0.01-0.1
+- **梯度裁剪**：限制梯度范数防止梯度爆炸
+  $$ g \leftarrow g \cdot \frac{\text{clip\_norm}}{\max(\|g\|, \text{clip\_norm})} $$
+- **标签平滑**：将 one-hot 标签软化，防止模型过度自信
+
+**6. 缩放定律与模型扩展**
+
+Kaplan et al. (2020) 提出 Transformer 的幂律缩放：
+$$ L(N, D) \approx \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\right)^{\alpha_D} $$
+其中 $N$ 为参数数，$D$ 为数据量，$\alpha_N \approx 0.076$, $\alpha_D \approx 0.095$。
+
+**7. 并行化策略**
+
+大规模 Transformer 需要多设备并行：
+
+- **数据并行**：不同设备处理不同批次，同步梯度（all-reduce）
+- **张量并行**：将权重矩阵分块到不同设备，需要通信激活和梯度
+- **流水线并行**：将层分配到不同设备，需要流水线气泡和激活 checkpointing
+- **序列并行**：将序列分块分配到不同设备，需要注意力通信
+
+**8. 推理优化技术**
+
+- **键值缓存**：自回归生成时缓存先前时间步的 K, V，避免重复计算
+- **量化**：将权重/激活从 fp32 降至 int8/int4，减少内存和计算
+- **蒸馏**：用小模型学习大模型输出分布，保持性能减少计算
+- **剪枝**：移除不重要的权重/注意力头，创建稀疏模型
+
+**9. 数值稳定性考量**
+
+- **深度 Transformer**：超过 100 层时需使用 Pre-LN 而非 Post-LN 保持稳定
+- **混合精度训练**：使用 fp16 但维护 fp32 主副本防止梯度下溢
+- **激活 checkpointing**：仅存储部分层激活，反向传播时重计算其余层
+
+**10. 与 §5.2 卷积神经网络的对比**
+
+| 特性 | CNN | Transformer |
+|------|-----|-------------|
+| **归纳偏置** | 局部性、平移等变 | 序列建模、全局依赖 |
+| **计算复杂度** | $O(n)$ | $O(n^2)$（注意力） |
+| **并行性** | 高度并行 | 序列依赖（解码器） |
+| **数据需求** | 较少 | 大量 |
+
+**11. Burn 中的 Transformer 实现**
+
+Burn 的 Transformer 模块设计灵活，支持自定义：
+- `TransformerEncoderConfig`：编码器配置
+- `TransformerDecoderConfig`：解码器配置  
+- `TransformerEncoderDecoderConfig`：完整编码器-解码器
+
+支持多种注意力机制、位置编码和归一化方案。
 
 ---
 
