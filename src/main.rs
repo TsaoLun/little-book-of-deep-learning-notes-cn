@@ -180,4 +180,81 @@ mod tests {
             false,
         );
     }
+
+    /// 3.4 学习率调度：预热 + 余弦退火（Warmup + Cosine Decay）
+    ///
+    /// ComposedLrScheduler 将各子调度器输出相乘（Prod）：
+    ///   线性预热（0→1 倍率）× 余弦退火（base_lr→0）= 先升后降的学习率曲线
+    ///
+    /// 这是现代大模型训练的标准做法：
+    ///   - 预热阶段（warmup）：线性调度使学习率从低升至目标值，避免训练初期梯度爆炸
+    ///   - 余弦退火阶段：学习率从高平滑降至接近 0，精确收敛到损失景观的狭窄谷底
+    #[test]
+    fn test_warmup_cosine_lr_scheduler() {
+        use burn::lr_scheduler::{
+            LrScheduler, composed::ComposedLrSchedulerConfig,
+            cosine::CosineAnnealingLrSchedulerConfig, linear::LinearLrSchedulerConfig,
+        };
+
+        let warmup_steps = 5_usize;
+        let total_steps = 20_usize;
+        let base_lr = 1e-3_f64;
+
+        // 线性预热倍率：1e-6 → 1.0（warmup_steps 步后保持 1.0）
+        // 余弦退火：base_lr → 0（total_steps 步内平滑衰减）
+        // 乘积 = 先升后降的 Warmup + Cosine Decay 曲线
+        // 注：LinearLrScheduler 要求 initial_lr > 0，故用极小正数 1e-6 近似 0
+        let mut scheduler = ComposedLrSchedulerConfig::new()
+            .cosine(CosineAnnealingLrSchedulerConfig::new(base_lr, total_steps))
+            .linear(LinearLrSchedulerConfig::new(1e-6, 1.0, warmup_steps))
+            .init()
+            .unwrap();
+
+        let lrs: Vec<f64> = (0..total_steps).map(|_| scheduler.step()).collect();
+
+        println!("预热 + 余弦退火学习率曲线（共 {total_steps} 步，前 {warmup_steps} 步预热）:");
+        for (i, lr) in lrs.iter().enumerate() {
+            let tag = if i < warmup_steps {
+                "↑预热"
+            } else {
+                "↓退火"
+            };
+            println!("  步 {:2} [{}]: {:.6}", i + 1, tag, lr);
+        }
+
+        // 验证预热阶段：学习率逐步上升
+        assert!(
+            lrs[1] > lrs[0],
+            "预热阶段第 2 步 ({:.6}) 应 > 第 1 步 ({:.6})",
+            lrs[1],
+            lrs[0]
+        );
+        assert!(
+            lrs[warmup_steps - 1] > lrs[0],
+            "预热结束时 ({:.6}) 应 > 起点 ({:.6})",
+            lrs[warmup_steps - 1],
+            lrs[0]
+        );
+
+        // 验证余弦退火阶段：预热结束后学习率持续下降
+        let post_warmup = &lrs[warmup_steps..];
+        for i in 1..post_warmup.len() {
+            assert!(
+                post_warmup[i] <= post_warmup[i - 1],
+                "余弦退火阶段步 {} ({:.6}) 应 ≤ 步 {} ({:.6})",
+                warmup_steps + i + 1,
+                post_warmup[i],
+                warmup_steps + i,
+                post_warmup[i - 1]
+            );
+        }
+
+        // 验证最终学习率趋近 0（余弦退火在 total_steps 步时输出 0）
+        assert!(
+            *lrs.last().unwrap() < base_lr / 10.0,
+            "最终学习率 ({:.6}) 应远小于基础学习率 ({:.6})",
+            lrs.last().unwrap(),
+            base_lr
+        );
+    }
 }
