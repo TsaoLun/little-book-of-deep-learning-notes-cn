@@ -215,9 +215,9 @@ mod tests {
         println!("预热 + 余弦退火学习率曲线（共 {total_steps} 步，前 {warmup_steps} 步预热）:");
         for (i, lr) in lrs.iter().enumerate() {
             let tag = if i < warmup_steps {
-                "↑预热"
+                "↑预热(线形为主+余弦退火弱->强)"
             } else {
-                "↓退火"
+                "↓退火(余弦)"
             };
             println!("  步 {:2} [{}]: {:.6}", i + 1, tag, lr);
         }
