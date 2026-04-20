@@ -257,4 +257,125 @@ mod tests {
             base_lr
         );
     }
+
+    /// 4.1 自动微分（Autodiff）：三步模式与链式法则验证
+    ///
+    /// 本测试渐进式地验证 Burn 自动微分的三个核心机制：
+    ///
+    /// 【Phase 1】最简梯度 — 标量乘法 c = a * b
+    ///   验证 ∂c/∂b = a，确认 require_grad / backward / grad 的基本流程。
+    ///
+    /// 【Phase 2】链式法则 — loss = mean(x @ y)
+    ///   用 2×2 固定矩阵手算每一步反向传播，验证框架输出与手算完全一致：
+    ///     mean backward: ∂loss/∂z = 1/N * ones
+    ///     matmul backward: ∂loss/∂y = xᵀ @ (∂loss/∂z)
+    ///
+    /// 【Phase 3】require_grad 语义
+    ///   未标记的张量调用 grad() 返回 None；标记的张量梯度可正常提取。
+    #[test]
+    fn test_autodiff() {
+        use burn::backend::Autodiff;
+        use burn::tensor::Tensor;
+
+        // ─── 第一步：用 Autodiff 包装后端 ───
+        type AutoBackend = Autodiff<Flex<f32>>;
+        let device = Default::default();
+
+        // ══════════════════════════════════════════════════════════════
+        // Phase 1: 最简梯度 — 标量乘法
+        // ══════════════════════════════════════════════════════════════
+        //
+        // 数学：c = a * b，∂c/∂b = a = 2.0
+        // 目的：验证三步流程 require_grad → backward → grad
+        println!("═══ Phase 1: 标量乘法 c = a * b ═══");
+
+        let a: Tensor<AutoBackend, 1> = Tensor::from_floats([2.0_f32], &device);
+        let b: Tensor<AutoBackend, 1> =
+            Tensor::from_floats([3.0_f32], &device).require_grad(); // 第二步：标记
+
+        let c = a.clone().mul(b.clone()); // 前向：c = 2 * 3 = 6
+        println!("c = a * b = {}", c);
+
+        let grads = c.backward(); // 第三步：反向传播
+        let grad_b: f32 = b
+            .grad(&grads)
+            .expect("b 已标记 require_grad，梯度应存在")
+            .into_scalar()
+            .elem::<f32>();
+        println!("∂c/∂b = {grad_b}  (预期 = a = 2.0)\n");
+        assert!(
+            (grad_b - 2.0).abs() < 1e-5,
+            "∂c/∂b 应为 2.0，实际为 {grad_b}"
+        );
+
+        // ══════════════════════════════════════════════════════════════
+        // Phase 2: 链式法则 — loss = mean(x @ y)
+        // ══════════════════════════════════════════════════════════════
+        //
+        // 前向传播：
+        //   x = [[1,0],[0,2]]  y = [[3,4],[5,6]]
+        //   z = x @ y = [[3,4],[10,12]]
+        //   loss = mean(z) = (3+4+10+12)/4 = 7.25
+        //
+        // 反向传播（链式法则，从输出到输入）：
+        //   节点2 mean: loss = (1/N) * Σz_ij，N = 2×2 = 4
+        //     ∂loss/∂z_ij = 1/N = 1/4 = 0.25（每个元素贡献相等）
+        //     → ∂loss/∂z = 0.25 * ones = [[0.25,0.25],[0.25,0.25]]
+        //   节点1 matmul: ∂loss/∂y = xᵀ @ (∂loss/∂z)
+        //                          = [[1,0],[0,2]]ᵀ @ [[0.25,0.25],[0.25,0.25]]
+        //                          = [[0.25,0.25],[0.5,0.5]]
+        println!("═══ Phase 2: 链式法则 loss = mean(x @ y) ═══");
+
+        let x: Tensor<AutoBackend, 2> =
+            Tensor::from_floats([[1.0_f32, 0.0], [0.0, 2.0]], &device);
+        let y: Tensor<AutoBackend, 2> =
+            Tensor::from_floats([[3.0_f32, 4.0], [5.0, 6.0]], &device).require_grad();
+
+        let z = x.clone().matmul(y.clone());
+        println!("z = x @ y = {}", z);
+        let loss = z.mean();
+        println!("loss = mean(z) = {}", loss);
+
+        let grads = loss.backward();
+        let grad_y = y.grad(&grads).expect("y 已标记 require_grad");
+        println!("∂loss/∂y = {}", grad_y);
+
+        // 验证：与手算结果逐元素比对
+        let expected = Tensor::<Flex<f32>, 2>::from_floats(
+            [[0.25_f32, 0.25], [0.5, 0.5]],
+            &device,
+        );
+        grad_y.to_data().assert_approx_eq::<f32>(
+            &expected.to_data(),
+            burn::tensor::Tolerance::absolute(1e-5),
+        );
+        println!("✓ 与手算结果一致: [[0.25, 0.25], [0.5, 0.5]]\n");
+
+        // ══════════════════════════════════════════════════════════════
+        // Phase 3: require_grad 语义
+        // ══════════════════════════════════════════════════════════════
+        //
+        // 未标记 require_grad 的张量 → grad() 返回 None
+        // 已标记 require_grad 的张量 → grad() 返回 Some(梯度)
+        println!("═══ Phase 3: require_grad 语义验证 ═══");
+
+        let p: Tensor<AutoBackend, 1> = Tensor::from_floats([5.0_f32], &device); // 无 require_grad
+        let q: Tensor<AutoBackend, 1> =
+            Tensor::from_floats([7.0_f32], &device).require_grad();
+        let r = p.clone().mul(q.clone());
+        let grads = r.backward();
+
+        assert!(
+            p.grad(&grads).is_none(),
+            "未标记 require_grad 的张量不应有梯度"
+        );
+        println!("p.grad() = None  ✓ (p 未标记 require_grad)");
+
+        let grad_q: f32 = q.grad(&grads).unwrap().into_scalar().elem::<f32>();
+        assert!(
+            (grad_q - 5.0).abs() < 1e-5,
+            "∂(p*q)/∂q 应为 p = 5.0，实际为 {grad_q}"
+        );
+        println!("q.grad() = {grad_q}  ✓ (∂(p*q)/∂q = p = 5.0)");
+    }
 }

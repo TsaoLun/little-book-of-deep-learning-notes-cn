@@ -985,27 +985,185 @@ fn step(&mut self) -> LearningRate {
 
 #### 入门：API 用法
 
-Burn 通过 `Autodiff` 后端装饰器提供自动微分功能，实现了 Autograd [Baydin et al., 2015] 算法——它跟踪张量操作并即时构建梯度算子的组合，使任意命令式张量代码都可以自动计算梯度。
+深度学习框架最核心的能力是**自动微分**：用户只需编写前向传播代码，框架自动完成反向传播并计算所有梯度。在 Burn 中，这通过三步完成：
+
+**第一步：用 `Autodiff` 包装后端**
 
 ```rust
-use burn::backend::{Autodiff, Wgpu};
-use burn::tensor::{Tensor, Distribution};
+use burn::backend::{Autodiff, Flex};
 
-type Backend = Autodiff<Wgpu>;
-
-let device = Default::default();
-let x: Tensor<Backend, 2> = Tensor::random([32, 32], Distribution::Default, &device);
-let y: Tensor<Backend, 2> = Tensor::random([32, 32], Distribution::Default, &device).require_grad();
-
-let z = x.matmul(y);
-let loss = z.mean();
-let grads = loss.backward(); // 自动计算梯度
+// Autodiff<B> 是泛型装饰器，可包装任意后端（Flex、Wgpu、Cuda、NdArray 等）
+type AutoBackend = Autodiff<Flex<f32>>;
 ```
 
-`Autodiff<B>` 是一个泛型装饰器，可包装任意后端 `B`（如 `Wgpu`、`Cuda`、`NdArray` 等）。其内部实现：
+**第二步：标记需要梯度的张量**
 
 ```rust
-// Autodiff 装饰器定义（crates/burn-autodiff/src/backend.rs）
+// 普通张量：不追踪梯度（视为常量）
+let x: Tensor<AutoBackend, 2> = Tensor::from_floats([[1.0, 0.0], [0.0, 2.0]], &device);
+
+// 调用 require_grad()：张量被纳入计算图，后续操作将记录以便反向传播
+let y: Tensor<AutoBackend, 2> = Tensor::from_floats([[3.0, 4.0], [5.0, 6.0]], &device)
+    .require_grad();
+```
+
+> `require_grad()` 是关键开关：只有标记了的张量才会被追踪梯度。在实际训练中，模型参数（权重、偏置）会自动标记，用户通常无需手动调用。
+
+**第三步：前向 → 反向 → 提取梯度**
+
+```rust
+// 前向传播：Burn 在后台自动记录操作，构建计算图
+let z = x.matmul(y.clone());   // 节点1：矩阵乘法
+let loss = z.mean();            // 节点2：取平均（得到标量损失）
+
+// 反向传播：一行代码，框架自动沿计算图应用链式法则
+let grads = loss.backward();
+
+// 提取梯度：通过 grad() 方法获取 ∂loss/∂y
+let grad_y = y.grad(&grads);    // → Some(Tensor)，因为 y 标记了 require_grad
+let grad_x = x.grad(&grads);    // → None，因为 x 未标记 require_grad
+```
+
+> `grad()` 返回 `Option<Tensor<B::InnerBackend, D>>`——注意返回的张量类型是**内部后端**（`Flex<f32>`），不是 `Autodiff<Flex<f32>>`，因为梯度本身不需要再被微分。
+
+#### 进阶：链式法则的具体推导
+
+上面的三步 API 背后，框架自动应用了链式法则。下面用具体的 2×2 矩阵例子展示**每一步的数学推导**，以及 Burn 源码中对应的实现。
+
+**设定**：$x = \begin{pmatrix} 1 & 0 \\ 0 & 2 \end{pmatrix}$，$y = \begin{pmatrix} 3 & 4 \\ 5 & 6 \end{pmatrix}$，计算 $\text{loss} = \text{mean}(x \cdot y)$，求 $\frac{\partial \text{loss}}{\partial y}$。
+
+**前向传播**：
+
+$$
+z = x \cdot y = \begin{pmatrix} 1 & 0 \\ 0 & 2 \end{pmatrix} \begin{pmatrix} 3 & 4 \\ 5 & 6 \end{pmatrix} = \begin{pmatrix} 3 & 4 \\ 10 & 12 \end{pmatrix}
+$$
+
+$$
+\text{loss} = \text{mean}(z) = \frac{3 + 4 + 10 + 12}{4} = 7.25
+$$
+
+**反向传播（从输出到输入，逐节点）**：
+
+**节点2：mean 的反向**
+
+mean 是对张量所有元素求平均：$\text{loss} = \text{mean}(z) = \frac{1}{N}\sum_{i,j} z_{ij}$，其中 $N$ 是张量的元素总数。由于 $z$ 是 $2 \times 2$ 矩阵，$N = 2 \times 2 = 4$。对任意元素 $z_{ij}$ 求偏导：
+
+$$
+\frac{\partial \text{loss}}{\partial z_{ij}} = \frac{\partial}{\partial z_{ij}} \frac{1}{N}\sum_{k,l} z_{kl} = \frac{1}{N} = \frac{1}{4} = 0.25
+$$
+
+每个元素的梯度都相同（均为 $\frac{1}{N}$），因此整个梯度张量是一个形状与 $z$ 相同的全 $0.25$ 矩阵：
+
+$$
+\frac{\partial \text{loss}}{\partial z} = \frac{1}{4} \cdot \mathbf{1}_{2 \times 2} = \begin{pmatrix} 0.25 & 0.25 \\ 0.25 & 0.25 \end{pmatrix}
+$$
+
+**Burn 源代码**（`crates/burn-autodiff/src/ops/tensor.rs`）：
+
+```rust
+// Mean::backward 的核心逻辑
+fn backward(self, ops: Ops<Self::State, 1>, grads: &mut Gradients, ..) {
+    unary::<B, _>(ops.parents, ops.node, grads, |grad| {
+        let shape = ops.state;
+        let val = 1_f64 / shape.num_elements() as f64;  // 1/N = 1/4 = 0.25
+        let ones = B::float_ones(shape, ..);             // 全 1 张量
+        let val = B::float_mul_scalar(ones, val.into()); // 0.25 * ones
+        B::float_mul(val, grad)                          // 与上游梯度相乘
+    });
+}
+```
+
+**节点1：matmul 的反向**
+
+对于 $z = x \cdot y$，我们需要求 $\frac{\partial \text{loss}}{\partial y}$。先推导矩阵乘法对右操作数的导数。
+
+考虑标量损失 $\text{loss}$ 对 $y$ 中某个元素 $y_{kj}$ 的偏导。由 $z_{ij} = \sum_k x_{ik} y_{kj}$，可知 $y_{kj}$ 只影响 $z$ 的第 $j$ 列中的所有行：
+
+$$
+\frac{\partial z_{ij}}{\partial y_{kj}} = x_{ik}
+$$
+
+应用链式法则，将上游梯度 $\frac{\partial \text{loss}}{\partial z_{ij}}$（已在节点2中求得）传递下来：
+
+$$
+\frac{\partial \text{loss}}{\partial y_{kj}} = \sum_i \frac{\partial \text{loss}}{\partial z_{ij}} \cdot \frac{\partial z_{ij}}{\partial y_{kj}} = \sum_i \frac{\partial \text{loss}}{\partial z_{ij}} \cdot x_{ik} = \sum_i x_{ik} \cdot \frac{\partial \text{loss}}{\partial z_{ij}}
+$$
+
+注意 $\sum_i x_{ik} \cdot (\cdot)_{ij}$ 正是矩阵 $x^\top$ 的第 $k$ 行与 $(\cdot)$ 的第 $j$ 列做内积，即矩阵乘法 $x^\top \cdot \frac{\partial \text{loss}}{\partial z}$ 的 $(k,j)$ 元素。因此：
+
+$$
+\frac{\partial \text{loss}}{\partial y} = x^\top \cdot \frac{\partial \text{loss}}{\partial z}
+$$
+
+代入具体数值：
+
+$$
+\frac{\partial \text{loss}}{\partial y} = \begin{pmatrix} 1 & 0 \\ 0 & 2 \end{pmatrix}^\top \begin{pmatrix} 0.25 & 0.25 \\ 0.25 & 0.25 \end{pmatrix} = \begin{pmatrix} 1 & 0 \\ 0 & 2 \end{pmatrix} \begin{pmatrix} 0.25 & 0.25 \\ 0.25 & 0.25 \end{pmatrix} = \begin{pmatrix} 0.25 & 0.25 \\ 0.5 & 0.5 \end{pmatrix}
+$$
+
+> 类似地，对左操作数 $x$ 的梯度为 $\frac{\partial \text{loss}}{\partial x} = \frac{\partial \text{loss}}{\partial z} \cdot y^\top$（在本例中 $x$ 未标记 `require_grad`，所以该分支不会执行）。
+
+**Burn 源代码**（`crates/burn-autodiff/src/ops/tensor.rs`）：
+
+```rust
+// Matmul::backward 的核心逻辑
+fn backward(self, ops: Ops<Self::State, 2>, grads: &mut Gradients, ..) {
+    let (lhs, rhs, broadcast) = ops.state;
+    binary::<B, _, _>(ops.parents, ops.node, grads,
+        |grad| {
+            // ∂loss/∂x = grad @ yᵀ（左操作数的梯度）
+            let rhs = B::float_transpose(rhs.unwrap());
+            B::float_matmul(grad, rhs)
+        },
+        |grad| {
+            // ∂loss/∂y = xᵀ @ grad（右操作数的梯度）
+            let lhs = B::float_transpose(lhs.unwrap());
+            B::float_matmul(lhs, grad)
+        },
+    );
+}
+```
+
+**代码与公式对应关系**：
+
+| 反向传播步骤 | 数学公式 | Burn 源代码 |
+|-------------|---------|------------|
+| mean 对每个元素的梯度 | $\frac{\partial \text{loss}}{\partial z_{ij}} = \frac{1}{N}$ | `float_mul_scalar(ones, 1/N)` |
+| matmul 对右操作数 $y$ 的梯度 | $\frac{\partial \text{loss}}{\partial y} = x^\top \cdot \frac{\partial \text{loss}}{\partial z}$ | `float_matmul(float_transpose(lhs), grad)` |
+| matmul 对左操作数 $x$ 的梯度 | $\frac{\partial \text{loss}}{\partial x} = \frac{\partial \text{loss}}{\partial z} \cdot y^\top$ | `float_matmul(grad, float_transpose(rhs))` |
+
+> 这个例子展示了链式法则的本质：从输出到输入，逐节点将"上游梯度"与"当前操作的局部导数"相乘。Burn 在 `backward()` 时自动遍历整个计算图完成这一过程。
+
+**计算图可视化**：
+
+```text
+y [require_grad]     x [常量]
+    │                  │
+    └───── matmul ─────┘
+              │
+           z [2×2]
+              │
+            mean
+              │
+         loss [标量]
+              │
+          backward()    ← 从此开始反向遍历
+              │
+     ┌────────┴────────┐
+     ↓                 ↓
+  ∂loss/∂y          ∂loss/∂x
+ (可提取)           (x 无 require_grad，
+                     梯度被丢弃)
+```
+
+#### 专家：Autodiff 后端内部实现
+
+**`Autodiff<B>` 结构体**：
+
+Burn 的自动微分通过装饰器模式实现——`Autodiff<B>` 包装任意后端 `B`，在每个张量操作时注册对应的反向传播节点：
+
+```rust
+// crates/burn-autodiff/src/backend.rs
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Autodiff<B, C = NoCheckpointing> {
     _b: PhantomData<B>,
@@ -1015,87 +1173,44 @@ pub struct Autodiff<B, C = NoCheckpointing> {
 impl<B: Backend, C: CheckpointStrategy> AutodiffBackend for Autodiff<B, C> {
     type InnerBackend = B;
     type Gradients = Gradients;
-    
+
     fn backward(tensor: AutodiffTensor<B>) -> Gradients {
         tensor.backward()
     }
 }
 ```
 
-注意泛型参数 `C: CheckpointStrategy`——这对应于 [§3.4](burn_foundations.md#34-学习率调度learning-rate-scheduling) 原文中提到的**检查点技术**：反向传播需保留前向传播的所有中间激活，内存与深度成比例增长。检查点技术通过仅存储部分层的激活、在反向传播时重新计算其余层来交换计算时间与内存 [Chen et al., 2016]。Burn 通过 `CheckpointStrategy` 泛型在编译期选择策略，默认 `NoCheckpointing` 保留所有激活。
+**`Backward` trait 与注册模式**：
 
-#### 进阶：链式法则
-
-Burn 通过 `Autodiff` 后端自动实现反向传播的链式法则。
-
-**数学原理**：
-对于复合函数 $f = f^{(D)} \circ f^{(D-1)} \circ \cdots \circ f^{(1)}$，链式法则为：
-$$
-\frac{\partial \ell}{\partial x^{(d-1)}} = \frac{\partial \ell}{\partial x^{(d)}} \cdot \frac{\partial f^{(d)}}{\partial x^{(d-1)}}
-$$
-
-**Burn 使用示例**：
+每个前向操作（如 `matmul`）在执行时，通过 `prepare()` → `stateful()` 模式决定是否注册反向节点：
 
 ```rust
-// 前向传播：计算复合函数
-let z = x.matmul(y);      // 矩阵乘法
-let w = z.relu();         // ReLU 激活
-let loss = w.mean();      // 损失函数
-
-// 自动反向传播：计算 ∂loss/∂x 和 ∂loss/∂y
-let grads = loss.backward();
-```
-
-**实现机制**：
-1. **计算图跟踪**：`Autodiff<B>` 包装后端，记录所有张量操作
-2. **梯度计算**：调用 `backward()` 时，沿计算图反向传播梯度
-3. **雅可比矩阵乘积**：自动计算每个操作的雅可比矩阵与上游梯度的乘积
-
-正如原文所述，前向传播和反向传播的实现细节对程序员是隐藏的——深度学习框架能够自动构建计算梯度的操作序列。在 Burn 中，用户只需编写前向传播代码，`Autodiff` 自动处理一切。
-
-#### 专家：计算图构建与链式法则的具体应用
-
-**计算图节点示意**：
-
-```rust
-type Backend = Autodiff<Wgpu>;
-
-// 以下每个操作都生成计算图中的一个节点
-let z = x.matmul(y);      // 节点1：矩阵乘法
-let w = z.relu();         // 节点2：ReLU激活  
-let loss = w.mean();      // 节点3：平均值
-
-// 反向传播（自动应用链式法则）
-let grads = loss.backward();
-```
-
-对于复合函数 $f(g(x))$，链式法则为：
-$$
-\frac{df}{dx} = \frac{df}{dg} \cdot \frac{dg}{dx}
-$$
-
-**以 ReLU 为例**：
-
-```rust
-// ReLU 的前向传播
-fn relu_forward(x: Tensor) -> Tensor {
-    x.maximum(0.0)
-}
-
-// ReLU 的反向传播（框架内部自动生成，用户无需手动编写）
-fn relu_backward(grad_output: Tensor, x: Tensor) -> Tensor {
-    let mask = x.greater_elem(0.0);  // ∂relu/∂x = 1 if x > 0 else 0
-    grad_output * mask
+// 以 matmul 为例（crates/burn-autodiff/src/ops/tensor.rs）
+match Matmul
+    .prepare::<C>([lhs.node.clone(), rhs.node.clone()])  // 检查操作数是否被追踪
+    .compute_bound()
+    .stateful()
+{
+    OpsKind::Tracked(mut prep) => {
+        // 至少一个操作数需要梯度 → 注册反向节点
+        // checkpoint：保存 lhs/rhs 的引用，供反向传播时使用
+        let lhs_state = rhs_tracked.then(|| prep.checkpoint(&lhs));
+        let rhs_state = lhs_tracked.then(|| prep.checkpoint(&rhs));
+        prep.finish((lhs_state, rhs_state, broadcast),
+                    B::float_matmul(lhs.primitive, rhs.primitive))
+    }
+    OpsKind::UnTracked(prep) => {
+        // 无操作数需要梯度 → 不注册反向节点，零开销
+        prep.finish(B::float_matmul(lhs.primitive, rhs.primitive))
+    }
 }
 ```
 
-**矩阵乘法的导数**：
-对于 $z = xy$，有：
-$$
-\frac{\partial z}{\partial x} = y^T, \quad \frac{\partial z}{\partial y} = x^T
-$$
+注意 `OpsKind::UnTracked` 分支——当**没有任何操作数标记 `require_grad`** 时，该操作完全不构建反向节点，避免不必要的内存和计算开销。这就是为什么推理时不需要 `Autodiff` 后端。
 
-**资源使用**：关于计算成本，线性操作前向传播需要一次矩阵乘积，反向传播需要两次（分别乘以 $\frac{\partial}{\partial x}$ 和 $\frac{\partial}{\partial y}$ 的雅可比矩阵），使得反向传播成本约为前向传播的两倍。存在通过可逆层 [Gomez et al., 2017] 或检查点技术（Burn 的 `CheckpointStrategy` 泛型）来交换内存和计算的方法。
+**`CheckpointStrategy`**：泛型参数 `C` 控制中间激活的保留策略。反向传播需要前向传播的中间结果（如上面 `checkpoint(&lhs)` 保存的 $x$），默认 `NoCheckpointing` 保留所有激活。检查点技术 [Chen et al., 2016] 通过仅存储部分层的激活、在反向传播时重新计算其余层来交换计算时间与内存。
+
+**计算成本**：以 matmul 为例，前向传播需要 1 次矩阵乘法；反向传播需要 2 次（$x^\top \cdot \text{grad}$ 和 $\text{grad} \cdot y^\top$），因此**反向传播成本约为前向传播的两倍**。内存方面，推理时只需存储当前层的输出，但训练时需保留所有中间激活（如 $x$ 和 $y$ 的值），内存与模型深度成比例增长。
 
 **视角转变**：深度学习成功的一个关键因素是不再试图改进通用优化方法，而是转向**设计模型本身以使其可优化**——这正是第 4-5 章中各种层设计（残差连接、归一化等）的核心动机。
 
