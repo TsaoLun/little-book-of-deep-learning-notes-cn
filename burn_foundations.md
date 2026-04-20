@@ -931,9 +931,9 @@ pub enum SchedulerReduction {
 
 $$
 \eta_t = \begin{cases}
-\dfrac{1}{K}\sum_{k=1}^{K} \eta_t^{(k)} & \text{Avg} \\[6pt]
-\sum_{k=1}^{K} \eta_t^{(k)} & \text{Sum} \\[6pt]
-\prod_{k=1}^{K} \eta_t^{(k)} & \text{Prod（默认）}
+\dfrac{1}{K}\displaystyle\sum_{k=1}^{K} \eta_t^{(k)} & \text{Avg} \\
+\displaystyle\sum_{k=1}^{K} \eta_t^{(k)} & \text{Sum} \\
+\displaystyle\prod_{k=1}^{K} \eta_t^{(k)} & \text{Prod（默认）}
 \end{cases}
 $$
 
