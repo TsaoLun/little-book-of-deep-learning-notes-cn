@@ -1087,9 +1087,10 @@ $$
 
 $$
 \frac{\partial \text{loss}}{\partial y_{kj}} = \sum_i \frac{\partial \text{loss}}{\partial z_{ij}} \cdot \frac{\partial z_{ij}}{\partial y_{kj}} = \sum_i \frac{\partial \text{loss}}{\partial z_{ij}} \cdot x_{ik} = \sum_i x_{ik} \cdot \frac{\partial \text{loss}}{\partial z_{ij}}
+= \sum_i (x^\top)_{ki} \cdot \frac{\partial \text{loss}}{\partial z_{ij}}
 $$
 
-注意 $\sum_i x_{ik} \cdot (\cdot)_{ij}$ 正是矩阵 $x^\top$ 的第 $k$ 行与 $(\cdot)$ 的第 $j$ 列做内积，即矩阵乘法 $x^\top \cdot \frac{\partial \text{loss}}{\partial z}$ 的 $(k,j)$ 元素。因此：
+这正好是矩阵乘法 $(A \cdot B)_{kj} = \sum_i A_{ki} B_{ij}$ 的定义，所以：
 
 $$
 \frac{\partial \text{loss}}{\partial y} = x^\top \cdot \frac{\partial \text{loss}}{\partial z}
