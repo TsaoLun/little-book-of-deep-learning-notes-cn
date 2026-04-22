@@ -1329,7 +1329,11 @@ fn clip_by_norm<B: Backend, const D: usize>(
 
 与 PyTorch 的 `nn.Sequential` 不同，Burn 通过 `#[derive(Module)]` 结构体显式声明各层并在 `forward` 中手动组合——层的调用链直接对应数学上的映射组合 $f^{(D)} \circ \cdots \circ f^{(1)}$，语义更清晰。
 
-**Burn 源代码**：`crates/burn-core/src/module/base.rs`（Module trait），`crates/burn-nn/src/modules/`
+**API 示例（入门）**
+
+下例仅用于演示 `#[derive(Module)]` 与模块化层组合的写法。
+
+> 源码接口与实现位置放在后续“进阶/专家”小节集中说明。
 
 ```rust
 use burn::{
