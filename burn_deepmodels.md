@@ -64,16 +64,91 @@ pub trait Module<B: Backend>: Clone + Send + Debug {
     fn to_device(self, device: &B::Device) -> Self;
     fn no_grad(self) -> Self;
     fn num_params(&self) -> usize;
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V);
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self;
+    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V); // 只读遍历参数树
+    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self; // 消费并重建参数树
     fn into_record(self) -> Self::Record;
     fn load_record(self, record: Self::Record) -> Self;
 }
 ```
 
+`visit()` 与 `map()` 构成了 Module 系统的“读写分离”设计：前者负责遍历和收集（如参数统计、梯度提取），后者负责按统一规则变换参数并返回更新后的新模块实例。
+
 #### 专家：Visitor/Mapper 模式与参数管理
 
-`#[derive(Module)]` 宏自动生成参数遍历逻辑，使优化器能够通过 `visit()` 和 `map()` 方法收集和应用梯度。参数包装在 `Param<T>` 结构中，包含唯一 ID 和梯度开关。
+基础定义可参考 `burn_foundations.md` 对 `ModuleVisitor` / `ModuleMapper` 的说明；这里聚焦训练时的关键路径：`visit()` 如何收集梯度，`map()` 如何应用梯度更新参数。
+
+**1. 叶节点行为：`Param<Tensor<...>>` 是递归终点**
+
+**Burn 源代码**：`crates/burn-core/src/module/param/tensor.rs`
+
+```rust
+impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D>> {
+    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
+        visitor.visit_float(self)
+    }
+
+    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
+        mapper.map_float(self)
+    }
+}
+```
+
+每个可训练参数都被包装为 `Param<T>`，并带有唯一 `ParamId`（见 `crates/burn-core/src/module/param/base.rs`）。优化器后续正是通过 `ParamId` 在“参数 ↔ 梯度”之间做精确匹配。
+
+**2. `#[derive(Module)]` 自动生成结构体级递归遍历**
+
+**Burn 源代码**：`crates/burn-derive/src/module/codegen_struct.rs`
+
+```rust
+// 生成 visit: enter -> visit 子字段 -> exit
+visitor.enter_module(name, container_type);
+burn::module::Module::visit(&self.field, visitor);
+visitor.exit_module(name, container_type);
+
+// 生成 map: enter -> map 子字段 -> exit -> 重建 Self
+mapper.enter_module(name, container_type);
+let field = burn::module::Module::map(self.field, mapper);
+mapper.exit_module(name, container_type);
+Self { field, ... }
+```
+
+因此不需要手动枚举每一层参数，模型树会自动递归下钻到每个 `Param` 叶子节点。
+
+**3. 梯度收集链路（`visit`）**
+
+从训练循环看，关键三步是：
+
+```rust
+let grads = loss.backward();
+let grads = GradientsParams::from_grads(grads, &model);
+model = optim.step(lr, model, grads);
+```
+
+对应源码链路如下：
+
+1. `loss.backward()` 产生自动微分后端的梯度表。
+2. `GradientsParams::from_grads(...)` 调用 `module.visit(...)`（`crates/burn-optim/src/optim/grads.rs`）。
+3. `GradientsParamsConverter::visit_float(...)` 在每个参数处执行：
+   - `param.val().grad_remove(self.grads)` 取出该参数对应梯度；
+   - `register(param.id, grad)` 写入 `GradientsParams`（键为 `ParamId`）。
+
+**4. 梯度应用链路（`map`）**
+
+`optim.step(lr, model, grads)` 内部会创建 `SimpleOptimizerMapper` 并调用 `module.map(&mut mapper)`（`crates/burn-optim/src/optim/simple/adaptor.rs`）。
+
+`map_float` 的核心流程：
+
+- `param.consume()` 取出 `(id, tensor, mapper)`；
+- `grads.remove(id)` 按 `ParamId` 取梯度；
+- `optimizer.step(lr, tensor.inner(), grad, state)` 计算新参数；
+- `Param::from_mapped_value(id, tensor, mapper)` 重建参数节点。
+
+这意味着 `map()` 不是“原地改值”，而是“遍历并重建”整个模块树，最终返回一个参数已更新的新模型实例。
+
+**流程总览**：
+`backward()` → `from_grads()` + `visit()` 收集梯度 → `optim.step()` + `map()` 应用梯度。
+
+这一机制让优化器实现只需关心“单个参数如何更新”，而参数树遍历与重建由 Module 系统统一处理。 
 
 **参数包装实现**：`crates/burn-core/src/module/param/base.rs`
 
@@ -86,6 +161,19 @@ pub struct Param<T: Parameter> {
     pub(crate) require_grad: bool,         // 是否需要梯度
 }
 ```
+
+`ParamId` 是优化器匹配梯度的核心键，`require_grad` 则控制该参数是否参与梯度计算与更新。 
+
+**最小端到端示例来源**：`burn/examples/custom-training-loop/src/lib.rs`
+
+```rust
+let grads = loss.backward();
+let grads = GradientsParams::from_grads(grads, &model);
+model = optim.step(config.lr, model, grads);
+```
+
+这三行正好对应上述“收集（visit）→ 应用（map）”的完整路径。 
+
 
 ---
 
@@ -204,7 +292,9 @@ pub enum LinearLayout {
 
 **5. 与 §3.3 的联系**
 
-线性层作为最基本的可训练模块，其梯度计算直接体现了 §3.3 中 SGD 的核心思想：$\theta \leftarrow \theta - \eta \nabla_\theta L$。优化器通过 `ModuleVisitor` 遍历线性层的 `Param<Weight>` 和 `Param<Bias>`，应用计算得到的梯度更新参数。
+线性层作为最基本的可训练模块，其梯度计算直接体现了 §3.3 中 SGD 的核心思想：$\theta \leftarrow \theta - \eta \nabla_\theta L$。在 Burn 中，这一过程分成两个阶段：先由 `ModuleVisitor` 通过 `visit()` 遍历线性层的 `Param<Weight>` 与 `Param<Bias>` 收集梯度（`GradientsParams`，键为 `ParamId`），再由 `ModuleMapper` 通过 `map()` 按同一 `ParamId` 应用更新并重建参数节点。这样优化器既不需要手动列举每层参数，也能保证梯度和参数一一对应。
+
+> 详细调用链（`backward() -> from_grads() -> visit() -> optim.step() -> map()`）见 [§4.1 层的概念（专家）](#41-层的概念the-concept-of-layers)。
 
 ---
 
