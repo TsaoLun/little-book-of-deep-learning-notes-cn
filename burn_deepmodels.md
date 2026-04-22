@@ -179,7 +179,11 @@ model = optim.step(config.lr, model, grads);
 
 ### 4.2 线性层（Linear Layers）
 
-线性层（实际为仿射变换）是深度学习中最基本的模块，实现 $Y = XW + b$ 的变换。
+线性层（更准确说是仿射层）实现
+$$
+Y = XW + b
+$$
+是 MLP、CNN 分类头、Transformer 前馈网络中最常见的基础模块。
 
 #### 入门：API 用法
 
@@ -200,13 +204,9 @@ let output = linear.forward(input);      // 形状 [32, 64]
 
 #### 进阶：数学公式与源码对应
 
-**数学公式**：
-对于输入 $X \in \mathbb{R}^{B \times D_{\text{in}}}$，权重 $W \in \mathbb{R}^{D_{\text{in}} \times D_{\text{out}}}$，偏置 $b \in \mathbb{R}^{D_{\text{out}}}$：
-$$
-Y = XW + b
-$$
+项目当前锁定版本（`Cargo.lock` 对应 commit `8cc356e`）下，线性层关键实现分成两层：
 
-**Burn 源代码**：`crates/burn-nn/src/modules/linear.rs`
+1) `crates/burn-nn/src/modules/linear.rs`：模块封装与参数配置
 
 ```rust
 impl<B: Backend> Linear<B> {
@@ -218,83 +218,88 @@ impl<B: Backend> Linear<B> {
         )
     }
 }
+```
 
-// 底层线性变换实现 (crates/burn-tensor/src/tensor/module/linear.rs)
+2) `crates/burn-tensor/src/tensor/module.rs`：底层张量算子 `linear`
+
+```rust
 pub fn linear<B: Backend, const D: usize>(
     input: Tensor<B, D>,
     weight: Tensor<B, 2>,
     bias: Option<Tensor<B, 1>>,
 ) -> Tensor<B, D> {
+    if D == 1 {
+        let input = input.unsqueeze::<2>();
+        let output = linear(input, weight, bias);
+        return output.squeeze_dim(0);
+    }
+
+    let weight = weight.unsqueeze::<D>();
+    let bias = bias.map(|bias| bias.unsqueeze::<D>());
+
     let output = input.matmul(weight);
     match bias {
-        Some(bias) => output + bias.unsqueeze_dim(0),
+        Some(bias) => output.add(bias),
         None => output,
     }
 }
 ```
 
-#### 专家：初始化策略、梯度计算与性能优化
+这里有三个非常关键的实现细节：
 
-**1. 初始化策略的数学原理**
+- **1D 输入特殊分支**：`D == 1` 时先升维成 2D 做 matmul，再 `squeeze_dim(0)` 返回，保证 `Linear` 对向量输入也可用。
+- **广播前置**：`weight.unsqueeze::<D>()` 与 `bias.unsqueeze::<D>()` 在 matmul/add 前执行，统一处理高维前缀批次维度（`[..., d_in] -> [..., d_out]`）。
+- **与 PyTorch 语义差异**：Burn 的 `linear` **不自动转置权重**；文档注释明确指出这点（PyTorch `F.linear` 是 `x @ weight^T + b`）。
 
-线性层的初始化策略旨在防止训练初期的梯度消失或爆炸问题。Burn 通过 `Initializer` 枚举提供多种初始化方法，每种对应不同的数学假设：
+#### 专家：初始化、布局映射与训练语义
 
+**1) `LinearConfig` 默认初始化不是“拍脑袋常量”，而是可推导的 Kaiming Uniform**
+
+`LinearConfig` 默认值：
 ```rust
-pub enum Initializer {
-    Constant { value: f64 },                     // 常数初始化
-    Uniform { min: f64, max: f64 },             // 均匀分布 U(a,b)
-    Normal { mean: f64, std: f64 },             // 正态分布 N(μ,σ²)
-    KaimingUniform { gain: f64, fan_out_only: bool },  // He 初始化（均匀）
-    KaimingNormal { gain: f64, fan_out_only: bool },   // He 初始化（正态）
-    XavierUniform { gain: f64 },                // Xavier/Glorot 初始化（均匀）
-    XavierNormal { gain: f64 },                 // Xavier/Glorot 初始化（正态）
+initializer: Initializer::KaimingUniform {
+    gain: 1.0 / sqrt(3.0),
+    fan_out_only: false,
 }
 ```
 
-**关键初始化公式**：
-- **Xavier/Glorot 初始化**：$\sigma = \text{gain} \times \sqrt{\frac{2}{n_{\text{in}} + n_{\text{out}}}}$，适用于 tanh/sigmoid 激活
-- **Kaiming/He 初始化**：$\sigma = \text{gain} \times \sqrt{\frac{2}{n_{\text{in}}}}$，适用于 ReLU 及其变体
+而 `Initializer` 源码中：
+- Kaiming Uniform 采样区间：
+  $$[-a, a],\quad a = \sqrt{3} \cdot gain \cdot \frac{1}{\sqrt{fan}}$$
+- 当 `gain = 1/\sqrt{3}` 且 `fan = fan_in`（`fan_out_only = false`）时：
+  $$a = \frac{1}{\sqrt{fan_{in}}}$$
 
-**2. 自动微分与梯度计算**
+这正对应 `Linear` 注释中的经典区间 `U(-k, k), k=\sqrt{1/d_{input}}`。
 
-线性层 $Y = XW + b$ 的前向传播简单，但反向传播需要计算三个梯度：
-- $\frac{\partial L}{\partial X} = \frac{\partial L}{\partial Y} W^\top$（输入梯度）
-- $\frac{\partial L}{\partial W} = X^\top \frac{\partial L}{\partial Y}$（权重梯度）
-- $\frac{\partial L}{\partial b} = \sum_{\text{batch}} \frac{\partial L}{\partial Y}$（偏置梯度）
+同一文件还实现了 Xavier/Kaiming 的 normal/uniform 版本：
+- Xavier: $$\sigma = \sqrt{\frac{2}{fan_{in}+fan_{out}}}$$
+- Kaiming: $$\sigma = \frac{1}{\sqrt{fan}}$$（再乘对应 gain）
 
-Burn 的自动微分后端通过 `matmul` 操作的梯度规则实现这些计算。`Tensor::matmul()` 在 `Autodiff<B>` 后端下会自动注册反向传播函数，计算上述梯度。
+**2) `LinearLayout::Col` 的重点在“参数存储布局”，不是改变前向公式**
 
-**3. 性能优化与底层实现**
+`LinearLayout` 有 `Row | Col` 两种布局。
 
-线性层的性能关键在矩阵乘法（GEMM）优化。Burn 的后端系统允许不同硬件平台实现优化的 `matmul`：
+- `Row`：按 `[d_input, d_output]` 初始化权重。
+- `Col`：先按 `[d_output, d_input]` 初始化，并通过 `save_mapper / load_mapper / init_mapper` 在保存、加载、初始化路径做转置映射，确保模块内部前向仍可按 `linear(input, weight, bias)` 一致工作。
 
-- **CPU 后端**：使用 BLAS 库（如 OpenBLAS、Intel MKL）的 `sgemm`/`dgemm` 函数
-- **GPU 后端**：调用 cuBLAS（NVIDIA）或 rocBLAS（AMD）的批处理 GEMM
-- **WASM 后端**：使用 SIMD 优化的 JavaScript 实现
+`linear.rs` 测试 `layout` 与 `col_row_same_result` 专门验证了：
+- Col 布局在序列化/反序列化后形状映射正确；
+- Col 与 Row 在同权重语义下前向结果一致。
 
-**内存布局优化**：`LinearLayout` 枚举支持行优先（C 风格）和列优先（Fortran 风格）存储：
-```rust
-pub enum LinearLayout {
-    Row,  // 内存连续存储行元素
-    Col,  // 内存连续存储列元素
-}
-```
+**3) 自动微分层面：Linear 的梯度来自基础算子组合规则**
 
-选择合适布局可以避免转置开销，直接匹配后端 BLAS 库的期望格式。
+`Linear::forward` 本身只是调用 `matmul + add` 组合；在 `Autodiff` 后端下，梯度由这些基础算子的反向规则自动组成。对应经典结果：
+- $$\partial L/\partial X = (\partial L/\partial Y)W^T$$
+- $$\partial L/\partial W = X^T(\partial L/\partial Y)$$
+- $$\partial L/\partial b = \sum_{batch}(\partial L/\partial Y)$$
 
-**4. 数值稳定性考量**
+**4) 与外部框架互操作时最容易踩坑的一点**
 
-虽然线性层本身没有 softmax 那样的数值溢出风险，但大规模矩阵乘法仍需要注意：
+若从 PyTorch `nn.Linear` 直接迁移权重，需先确认权重形状语义：
+- PyTorch 常见存储：`[d_out, d_in]`
+- Burn `linear` 计算期望：`[d_in, d_out]`
 
-- **混合精度训练**：使用 `f16` 或 `bf16` 可减少内存占用和加速计算，但需注意精度损失和溢出风险
-- **梯度裁剪**：大权重矩阵可能导致梯度爆炸，需在优化器中设置梯度裁剪
-- **条件数**：权重矩阵的条件数 $\kappa(W) = \|W\| \cdot \|W^{-1}\|$ 影响数值稳定性，正交初始化有助于保持条件数接近 1
-
-**5. 与 §3.3 的联系**
-
-线性层作为最基本的可训练模块，其梯度计算直接体现了 §3.3 中 SGD 的核心思想：$\theta \leftarrow \theta - \eta \nabla_\theta L$。在 Burn 中，这一过程分成两个阶段：先由 `ModuleVisitor` 通过 `visit()` 遍历线性层的 `Param<Weight>` 与 `Param<Bias>` 收集梯度（`GradientsParams`，键为 `ParamId`），再由 `ModuleMapper` 通过 `map()` 按同一 `ParamId` 应用更新并重建参数节点。这样优化器既不需要手动列举每层参数，也能保证梯度和参数一一对应。
-
-> 详细调用链（`backward() -> from_grads() -> visit() -> optim.step() -> map()`）见 [§4.1 层的概念（专家）](#41-层的概念the-concept-of-layers)。
+因此通常需要显式转置后再导入，避免“能跑但结果错”的隐蔽问题。
 
 ---
 
