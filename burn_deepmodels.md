@@ -73,106 +73,34 @@ pub trait Module<B: Backend>: Clone + Send + Debug {
 
 `visit()` 与 `map()` 构成了 Module 系统的“读写分离”设计：前者负责遍历和收集（如参数统计、梯度提取），后者负责按统一规则变换参数并返回更新后的新模块实例。
 
-#### 专家：Visitor/Mapper 模式与参数管理
+#### 专家：训练时的梯度收集与应用链路
 
-基础定义可参考 `burn_foundations.md` 对 `ModuleVisitor` / `ModuleMapper` 的说明；这里聚焦训练时的关键路径：`visit()` 如何收集梯度，`map()` 如何应用梯度更新参数。
+> Visitor/Mapper 模式的基础定义（`ModuleVisitor`/`ModuleMapper` trait、`Param<T>` 包装结构、`#[derive(Module)]` 的宏展开细节）见 [`burn_foundations.md` §5](burn_foundations.md#5-深度的价值the-value-of-depth)。这里聚焦训练时的关键路径：`visit()` 如何收集梯度，`map()` 如何应用梯度。
 
-**1. 叶节点行为：`Param<Tensor<...>>` 是递归终点**
+**梯度收集链路（`visit`）**：
 
-**Burn 源代码**：`crates/burn-core/src/module/param/tensor.rs`
-
-```rust
-impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D>> {
-    fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        visitor.visit_float(self)
-    }
-
-    fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        mapper.map_float(self)
-    }
-}
-```
-
-每个可训练参数都被包装为 `Param<T>`，并带有唯一 `ParamId`（见 `crates/burn-core/src/module/param/base.rs`）。优化器后续正是通过 `ParamId` 在“参数 ↔ 梯度”之间做精确匹配。
-
-**2. `#[derive(Module)]` 自动生成结构体级递归遍历**
-
-**Burn 源代码**：`crates/burn-derive/src/module/codegen_struct.rs`
-
-```rust
-// 生成 visit: enter -> visit 子字段 -> exit
-visitor.enter_module(name, container_type);
-burn::module::Module::visit(&self.field, visitor);
-visitor.exit_module(name, container_type);
-
-// 生成 map: enter -> map 子字段 -> exit -> 重建 Self
-mapper.enter_module(name, container_type);
-let field = burn::module::Module::map(self.field, mapper);
-mapper.exit_module(name, container_type);
-Self { field, ... }
-```
-
-因此不需要手动枚举每一层参数，模型树会自动递归下钻到每个 `Param` 叶子节点。
-
-**3. 梯度收集链路（`visit`）**
-
-从训练循环看，关键三步是：
+训练循环的关键三步 —— `backward()` → `GradientsParams::from_grads()` → `optim.step()`：
 
 ```rust
 let grads = loss.backward();
-let grads = GradientsParams::from_grads(grads, &model);
-model = optim.step(lr, model, grads);
+let grads = GradientsParams::from_grads(grads, &model);  // 内部调用 module.visit()
+model = optim.step(lr, model, grads);                     // 内部调用 module.map()
 ```
 
-对应源码链路如下：
+`GradientsParams::from_grads(...)` (crates/burn-optim/src/optim/grads.rs) 通过 `visit()` 遍历每个 `Param`，调用 `param.val().grad_remove(grads)` 按 `ParamId` 取出梯度 → 写入 `GradientsParams`。
 
-1. `loss.backward()` 产生自动微分后端的梯度表。
-2. `GradientsParams::from_grads(...)` 调用 `module.visit(...)`（`crates/burn-optim/src/optim/grads.rs`）。
-3. `GradientsParamsConverter::visit_float(...)` 在每个参数处执行：
-   - `param.val().grad_remove(self.grads)` 取出该参数对应梯度；
-   - `register(param.id, grad)` 写入 `GradientsParams`（键为 `ParamId`）。
+**梯度应用链路（`map`）**：
 
-**4. 梯度应用链路（`map`）**
+`optim.step()` 创建 `SimpleOptimizerMapper`，调用 `module.map(&mut mapper)`，对每个参数执行：
 
-`optim.step(lr, model, grads)` 内部会创建 `SimpleOptimizerMapper` 并调用 `module.map(&mut mapper)`（`crates/burn-optim/src/optim/simple/adaptor.rs`）。
+- `param.consume()` 取出 `(id, tensor, mapper)`
+- `grads.remove(id)` 按 `ParamId` 取梯度
+- `optimizer.step(lr, tensor, grad, state)` 计算新参数
+- `Param::from_mapped_value(...)` 重建参数节点，返回新模型实例
 
-`map_float` 的核心流程：
+**流程总览**：`backward()` → `from_grads()` + `visit()` 收集 → `optim.step()` + `map()` 应用 → 返回参数更新后的新模型。
 
-- `param.consume()` 取出 `(id, tensor, mapper)`；
-- `grads.remove(id)` 按 `ParamId` 取梯度；
-- `optimizer.step(lr, tensor.inner(), grad, state)` 计算新参数；
-- `Param::from_mapped_value(id, tensor, mapper)` 重建参数节点。
-
-这意味着 `map()` 不是“原地改值”，而是“遍历并重建”整个模块树，最终返回一个参数已更新的新模型实例。
-
-**流程总览**：
-`backward()` → `from_grads()` + `visit()` 收集梯度 → `optim.step()` + `map()` 应用梯度。
-
-这一机制让优化器实现只需关心“单个参数如何更新”，而参数树遍历与重建由 Module 系统统一处理。 
-
-**参数包装实现**：`crates/burn-core/src/module/param/base.rs`
-
-```rust
-pub struct Param<T: Parameter> {
-    pub id: ParamId,                       // 唯一标识符
-    state: SyncOnceCell<T>,                // 延迟初始化的张量值
-    initialization: Option<...>,           // 惰性初始化配置
-    param_mapper: ParamMapper<T>,          // load/save 变换器
-    pub(crate) require_grad: bool,         // 是否需要梯度
-}
-```
-
-`ParamId` 是优化器匹配梯度的核心键，`require_grad` 则控制该参数是否参与梯度计算与更新。 
-
-**最小端到端示例来源**：`burn/examples/custom-training-loop/src/lib.rs`
-
-```rust
-let grads = loss.backward();
-let grads = GradientsParams::from_grads(grads, &model);
-model = optim.step(config.lr, model, grads);
-```
-
-这三行正好对应上述“收集（visit）→ 应用（map）”的完整路径。 
+`map()` 是”遍历并重建”整个模块树（非原地改值），这保证优化器只需关心单参数更新，参数树遍历由 Module 系统统一处理。 
 
 
 ---
@@ -336,38 +264,36 @@ $$
 Y_{b,c',h,w} = \sum_{c=1}^{C_{\text{in}}} \sum_{k=1}^{K} \sum_{l=1}^{L} X_{b,c,h+k,w+l} \cdot W_{c',c,k,l} + b_{c'}
 $$
 
-**Burn 源代码**：`crates/burn-nn/src/modules/conv/base.rs`
+**Burn 源代码**：`crates/burn-nn/src/modules/conv/conv2d.rs`
 
 ```rust
-impl<B: Backend, const D: usize> Conv<B, D> {
-    pub fn forward<const D2: usize>(&self, input: Tensor<B, D2>) -> Tensor<B, D2> {
-        conv::convolution(
+impl<B: Backend> Conv2d<B> {
+    pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+        conv2d(
             input,
             self.weight.val(),
             self.bias.as_ref().map(|b| b.val()),
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
+            PaddedConvOptions::new(self.stride, [self.padding, self.padding], self.dilation, self.groups),
         )
     }
 }
 ```
 
+卷积操作按维度分为 `conv1d`、`conv2d`、`conv3d` 三个独立函数，位于 `crates/burn-tensor/src/tensor/module.rs`。
+
 #### 专家：卷积算法、梯度计算与性能优化
 
 **1. 卷积算法的实现策略**
 
-卷积操作的计算复杂度高（$O(B \cdot C_{\text{in}} \cdot C_{\text{out}} \cdot H \cdot W \cdot K \cdot L)$），因此 Burn 后端采用多种优化策略：
+卷积操作的计算复杂度高（$O(B \cdot C_{\text{in}} \cdot C_{\text{out}} \cdot H \cdot W \cdot K \cdot L)$），不同后端采用各自的优化策略：
 
-- **im2col + GEMM**：将卷积展开为大型矩阵乘法，利用 BLAS 库的优化 GEMM 函数
-  ```rust
-  // 概念性伪代码
-  let im2col = input.im2col(kernel_size, stride, padding, dilation);
-  let output = im2col.matmul(weight.reshape([C_out, C_in * K * L]));
-  ```
-- **Winograd 算法**：对小型核（3×3）使用 Winograd 变换减少乘法次数
-- **FFT 卷积**：对大型核使用快速傅里叶变换，将时域卷积转为频域点乘
+- **NdArray 后端**（CPU）：直接 MAD（Multiply-Add）嵌套循环实现，`crates/burn-ndarray/src/ops/conv.rs`
+- **CubeCL 后端**（GPU）：提供多种策略可选
+  - `direct`：直接卷积计算
+  - `im2col`：将卷积展开为矩阵乘法，利用 GPU GEMM 优化（`crates/burn-cubecl/src/kernel/conv/im2col.rs`）
+  - `implicit_gemm`：隐式 GEMM 算法，避免显式 im2col 的内存开销（`crates/burn-cubecl/src/kernel/conv/forward/implicit_gemm/`）
+
+注意：Burn 目前未实现 Winograd 或 FFT 卷积算法。
 
 **2. 自动微分与梯度计算**
 
@@ -388,12 +314,12 @@ Burn 的 `Autodiff` 后端为 `convolution` 操作注册自定义梯度函数，
   - 极端情况 `groups = C_in = C_out` 为深度可分离卷积
 - **可变形卷积**：通过学习偏移量使采样位置自适应内容
 
-**4. 性能优化技术**
+**4. Burn 中的性能优化**
 
-- **内存布局**：NHWC（通道最后）与 NCHW（通道优先）布局对 GPU/CPU 性能影响不同
-- **核融合**：将卷积 + 批归一化 + 激活函数融合为单个 GPU 核函数，减少内存传输
-- **张量核心**：利用 NVIDIA Tensor Cores 进行混合精度（fp16/bf16）卷积
-- **分组卷积优化**：对 `groups > 1` 使用专门的核函数避免冗余计算
+- **`burn-fusion` 算子融合**：`Autodiff<B, burn::backend::Fusion>` 自动合并连续逐元素操作（如 `relu(bn(conv(x)))` 中的 add/mul/relu），减少中间张量分配和内存传输
+- **后端策略选择**：CubeCL GPU 后端支持 `direct`、`im2col`、`implicit_gemm` 多种卷积策略，可通过 autotune 自动选择最优方案（`crates/burn-cubecl/src/kernel/conv/forward/`）
+- **分组卷积**：`Conv2dConfig::with_groups(n)` 直接映射后端优化路径，无需特殊模块
+- **混合精度**：`burn::backend::Autodiff<MixedPrecisionBackend<Wgpu>>` 自动管理 fp16/bf16 前向传播和 fp32 主权重副本
 
 **5. 数值稳定性与精度**
 
@@ -456,31 +382,66 @@ $$
 Y_{b,c,h,w} = \frac{1}{KL} \sum_{k=0}^{K-1} \sum_{l=0}^{L-1} X_{b,c, S_h h + k, S_w w + l}
 $$
 
-**Burn 源代码**：`crates/burn-nn/src/modules/pool/`
+**Burn 源代码**：`crates/burn-nn/src/modules/pool/max_pool2d.rs`，底层实现在 `crates/burn-tensor/src/tensor/module.rs`
 
 ```rust
-// 最大池化实现（简化）
-pub fn max_pool2d<B: Backend>(
-    x: Tensor<B, 4>,
-    kernel_size: [usize; 2],
-    stride: [usize; 2],
-    padding: [usize; 2],
-    dilation: [usize; 2],
-) -> Tensor<B, 4> {
-    // 使用滑动窗口提取局部块，计算最大值
-    x.unfold(kernel_size, stride, padding, dilation)
-     .max_dim(2)  // 沿空间维度取最大值
-     .max_dim(3)
+// MaxPool2d::forward 调用 burn::tensor::module::max_pool2d
+impl MaxPool2d {
+    pub fn forward<B: Backend>(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
+        let [_batch_size, _channels_in, height_in, width_in] = input.dims();
+        let ((top, bottom), (left, right)) =
+            self.padding.calculate_padding_2d_pairs(height_in, width_in, &self.kernel_size, &self.stride);
+        // 非对称 padding 时先显式 pad，再调用零 padding 的池化
+        if top != bottom || left != right {
+            let padded = input.pad((left, right, top, bottom), PadMode::Constant(f32::NEG_INFINITY));
+            max_pool2d(padded, self.kernel_size, self.stride, [0, 0], self.dilation, self.ceil_mode)
+        } else {
+            max_pool2d(input, self.kernel_size, self.stride, [top, left], self.dilation, self.ceil_mode)
+        }
+    }
 }
 ```
 
+`max_pool2d` 由各后端分别实现。以 ndarray 后端（`crates/burn-ndarray/src/ops/maxpool.rs`）为例，核心逻辑是直接嵌套循环遍历输出位置和池化窗口：
+
+```rust
+for oh in 0..out_height {
+    for ow in 0..out_width {
+        let mut max_val = -f32::INFINITY;
+        for kh in 0..kernel_height {
+            for kw in 0..kernel_width {
+                let val = x[[b, c, ih, iw]];
+                if val > max_val { max_val = val; }
+            }
+        }
+        output[[b, c, oh, ow]] = max_val;
+    }
+}
+```
+
+池化前先用 `-inf` 填充边界（`apply_padding_4d`），确保填充区域不影响最大值结果。
+
 #### 专家：池化策略与梯度传播
 
-**梯度传播特性**：
-- **最大池化**：梯度仅流向最大值所在位置
-- **平均池化**：梯度均匀分配到所有输入位置
+**最大池化的梯度传播**（ndarray 后端 `max_pool2d_backward`，`crates/burn-ndarray/src/ops/maxpool.rs:205`）：
 
-**自适应池化**：`AdaptiveAvgPool2d` 自动调整核大小以获得指定输出尺寸。
+最大池化使用索引追踪（`max_pool2d_with_indices`）记录每个输出位置对应输入中最大值的位置，反向传播时梯度仅流向该索引处：
+
+```rust
+// backward: 仅最大值位置接收梯度
+for h in 0..height {
+    for w in 0..width {
+        let index = indices[[b, c, h, w]];  // 前向时记录的最大值坐标
+        output[[b, c, index_h, index_w]] += output_grad[[b, c, h, w]];
+    }
+}
+```
+
+平均池化则均匀分配：$\frac{\partial L}{\partial x_{ij}} = \frac{1}{K \times L} \cdot \frac{\partial L}{\partial y}$。
+
+**自适应池化**：`AdaptiveAvgPool2d`（`crates/burn-nn/src/modules/pool/adaptive_avg_pool2d.rs`）按目标输出尺寸反推核大小与步幅，再调用标准 `avg_pool2d`，无需训练参数。
+
+**池化的配置语义**：Burn 的 `PaddingConfig2d` 支持 `Valid`（无填充）、`Same`（保持尺寸，偶数核自动用非对称填充）和 `Explicit(top, left, bottom, right)` 三种模式。`ceil_mode` 控制输出尺寸上取整还是下取整。
 
 ---
 
@@ -493,19 +454,18 @@ Dropout 是一种正则化技术，通过随机丢弃激活防止过拟合和促
 **Burn 实现**：`burn::nn::Dropout`
 
 ```rust
-use burn::nn::Dropout;
+use burn::nn::{Dropout, DropoutConfig};
 use burn::prelude::*;
 
-let dropout = Dropout::new(0.5);  // 丢弃概率 50%
+let dropout = DropoutConfig::new(0.5).init();  // 丢弃概率 50%
 let device = Default::default();
 
-// 训练模式
+// 训练模式：自动微分后端（Autodiff）下自动生效
 let input = Tensor::<Backend, 2>::random([32, 128], Distribution::Default, &device);
 let output_train = dropout.forward(input.clone());
 
-// 评估模式
-dropout.eval();
-let output_eval = dropout.forward(input);
+// 评估模式：非 Autodiff 后端下直接返回输入
+let output_eval = dropout.forward(input);  // 等同恒等映射
 ```
 
 #### 进阶：数学公式与源码对应
@@ -521,37 +481,34 @@ $$
 **Burn 源代码**：`crates/burn-nn/src/modules/dropout.rs`
 
 ```rust
-impl<B: Backend> Dropout<B> {
-    pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        if !self.is_active {
-            return input;  // 评估模式：直接返回输入
+impl Dropout {
+    pub fn forward<B: Backend, const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        // 非 Autodiff 后端或 prob=0 时直接返回输入（零开销）
+        if !B::ad_enabled(&input.device()) || self.prob == 0.0 {
+            return input;
         }
-        
-        let mask = Tensor::<B, D, Bool>::random(
-            input.shape(),
-            Distribution::Bernoulli(self.prob),
-            &input.device(),
-        );
-        
-        input.mask_fill(mask.clone(), 0.0) / (1.0 - self.prob)
+        // 训练模式：生成 Bernoulli 掩码并缩放
+        let prob_keep = 1.0 - self.prob;
+        let random = input.random_like(Distribution::Bernoulli(prob_keep));
+        input * random * (1.0 / prob_keep)
     }
 }
 ```
 
+Dropout 的模式切换不依赖显式 `train()/eval()` 方法，而是通过 `B::ad_enabled()` 自动检测后端类型——`Autodiff` 后端自动启用 dropout，纯推理后端则直接透传。
+
 #### 专家：Dropout 变体与空间 Dropout
 
 **Dropout 变体**：
-- **标准 Dropout**：独立丢弃每个激活
-- **空间 Dropout**（Spatial Dropout）：丢弃整个特征图（通道），适用于卷积层
-- **Dropout2d**：`burn::nn::Dropout2d` 实现空间 Dropout
+- **标准 Dropout**：独立丢弃每个激活。Burn 的 `Dropout` 是维度无关的——`forward<B, const D: usize>` 接受任意维度的张量
+- **空间 Dropout 模式**：丢弃整个特征图（通道），适用于卷积层。Burn 没有独立的 `Dropout2d` 模块，但可通过在通道维度生成掩码手动实现：先创建形状 `[B, C, 1, 1]` 的 Bernoulli 掩码再广播
+- **DropPath（随机深度）**：以概率 $p$ 丢弃整个残差块，需手动实现
 
-**训练/评估模式切换**：
-```rust
-impl<B: Backend> Dropout<B> {
-    pub fn train(&mut self) { self.is_active = true; }
-    pub fn eval(&mut self) { self.is_active = false; }
-}
-```
+**训练/评估模式切换**：Dropout 通过 `B::ad_enabled()` 自动检测当前后端类型：
+- `Autodiff` 后端 → `ad_enabled() = true` → 执行 dropout
+- 纯推理后端 → `ad_enabled() = false` → 透传输入
+
+这比显式 `train()/eval()` 状态切换更安全——不会因忘记切换模式而导致推理时执行 dropout。
 
 ---
 
@@ -563,25 +520,27 @@ impl<B: Backend> Dropout<B> {
 
 **Batch Normalization**：
 ```rust
-use burn::nn::norm::{BatchNorm1d, BatchNorm1dConfig};
+use burn::nn::norm::{BatchNorm, BatchNormConfig};
 use burn::prelude::*;
 
 let device = Default::default();
-let bn = BatchNorm1dConfig::new(128)  // 特征维度 128
-    .with_eps(1e-5)                   // 数值稳定性常数
-    .with_momentum(0.1)               // 移动平均动量
+let bn = BatchNormConfig::new(128)  // 特征数 128
+    .with_epsilon(1e-5)              // 数值稳定性常数
+    .with_momentum(0.1)              // 移动平均动量
     .init(&device);
 
 let input = Tensor::<Backend, 2>::random([32, 128], Distribution::Default, &device);
-let output = bn.forward(input);
+let output = bn.forward(input);      // forward<const D: usize> 自动适配任意维度
 ```
+
+Burn 的 `BatchNorm<B>` 是维度泛型的——单个结构体通过 `forward<const D: usize>()` 处理 1D/2D/3D 输入，无 `BatchNorm1d/2d/3d` 的区分。
 
 **Layer Normalization**：
 ```rust
 use burn::nn::norm::{LayerNorm, LayerNormConfig};
 
 let ln = LayerNormConfig::new(128)  // 特征维度 128
-    .with_eps(1e-5)
+    .with_epsilon(1e-5)
     .init(&device);
 
 let output = ln.forward(input);
@@ -599,40 +558,45 @@ $$
 \hat{x}_i = \frac{x_i - \mathbb{E}[x]}{\sqrt{\text{Var}[x] + \epsilon}} \quad;\quad y_i = \gamma \hat{x}_i + \beta
 $$
 
-**Burn 源代码**：`crates/burn-nn/src/modules/norm/`
+**Burn 源代码**：`crates/burn-nn/src/modules/norm/batch.rs`
 
 ```rust
-// BatchNorm 前向传播（简化）
-pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-    if self.training {
-        // 训练模式：计算批次统计量，更新移动平均
-        let mean = input.mean_dim(D - 1);
-        let var = input.var_dim(D - 1, self.eps);
-        
-        // 更新移动统计量
-        self.running_mean = self.momentum * self.running_mean + (1.0 - self.momentum) * mean;
-        self.running_var = self.momentum * self.running_var + (1.0 - self.momentum) * var;
-        
-        // 归一化并缩放
-        let normalized = (input - mean) / (var + self.eps).sqrt();
-        normalized * self.weight + self.bias
-    } else {
-        // 评估模式：使用移动统计量
-        let normalized = (input - self.running_mean) / (self.running_var + self.eps).sqrt();
-        normalized * self.weight + self.bias
+// BatchNorm 前向传播（简化自源码）
+impl<B: Backend> BatchNorm<B> {
+    pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        // 通过 B::ad_enabled() 自动判断训练/推理模式
+        match B::ad_enabled(&input.device()) {
+            true => self.forward_train(input),
+            false => self.forward_inference(input),
+        }
+    }
+    
+    fn forward_train<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
+        // 计算当前批次的均值与方差
+        let mean = /* 沿 batch 和 spatial 维度求均值 */;
+        let var = /* 沿 batch 和 spatial 维度求方差 */;
+        // 更新移动统计量: running = (1-momentum)*old + momentum*new
+        let running_mean = running_mean.mul_scalar(1.0 - self.momentum)
+            .add(mean.clone().detach().mul_scalar(self.momentum));
+        // 归一化 + 缩放
+        let normalized = (input - mean) / (var + self.epsilon).sqrt();
+        normalized.mul(self.gamma.val()).add(self.beta.val())
     }
 }
 ```
+
+注意：`running_mean` 更新遵循 `(1−momentum)×old + momentum×new`，而非常见的 `momentum×old + (1−momentum)×new`。`gamma`/`beta` 初始化为全 1/全 0。
 
 #### 专家：归一化变体与应用场景
 
 **归一化层对比**：
 | 类型 | 归一化维度 | 适用场景 | Burn 实现 |
 |------|-----------|----------|-----------|
-| **BatchNorm** | 批次维度 | 卷积网络、大批次训练 | `BatchNorm1d/2d/3d` |
-| **LayerNorm** | 特征维度 | Transformer、RNN、小批次 | `LayerNorm` |
-| **InstanceNorm** | 空间维度 | 风格迁移、生成模型 | `InstanceNorm1d/2d/3d` |
-| **GroupNorm** | 分组特征 | 小批次训练 | `GroupNorm` |
+| **BatchNorm** | 批次×空间维度 | 卷积网络、大批次训练 | `BatchNorm<B>` — `forward<const D: usize>` 泛型适配 |
+| **LayerNorm** | 特征维度 | Transformer、RNN、小批次 | `LayerNorm<B>` |
+| **InstanceNorm** | 空间维度 | 风格迁移、生成模型 | `InstanceNorm<B>` |
+| **GroupNorm** | 分组特征 | 小批次训练 | `GroupNorm<B>` |
+| **RmsNorm** | 特征维度 | LLaMA 类模型 | `RmsNorm<B>` |
 
 **数值稳定性**：`eps` 参数防止除零错误，通常设置为 $10^{-5}$。
 
@@ -690,19 +654,51 @@ output = conv1x1(relu(bn(conv3x3(relu(bn(conv1x1(input))))))) + input;
 
 #### 专家：残差连接变体与初始化
 
-**残差连接变体**：
-- **Pre-activation**：归一化和激活在卷积之前（ResNet v2）
-- **Bottleneck**：使用 1x1 卷积减少和恢复维度
-- **Dense connections**：连接所有前序层（DenseNet）
+**Pre-activation 残差块**（ResNet v2）——归一化和激活在卷积之前，梯度路径更短：
 
-**初始化策略**：残差块的最后一层通常使用零初始化，使网络初始状态接近恒等映射。
+```rust
+// Pre-activation: BN → ReLU → Conv → BN → ReLU → Conv, 最后+ shortcut
+fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let residual = x.clone();
+    let x = self.bn1.forward(x);
+    let x = burn::tensor::activation::relu(x);
+    let x = self.conv1.forward(x);
+    let x = self.bn2.forward(x);
+    let x = burn::tensor::activation::relu(x);
+    let x = self.conv2.forward(x);
+    x + residual
+}
+```
+
+**Bottleneck 残差块**——1×1 卷积压缩/恢复维度，减少参数：
+
+```rust
+fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+    let residual = x.clone();
+    let x = self.conv1.forward(x);  // 1x1: C_in → C_mid (降维)
+    let x = self.bn1.forward(x);
+    let x = burn::tensor::activation::relu(x);
+    let x = self.conv2.forward(x);  // 3x3: C_mid → C_mid
+    let x = self.bn2.forward(x);
+    let x = burn::tensor::activation::relu(x);
+    let x = self.conv3.forward(x);  // 1x1: C_mid → C_out (升维)
+    let x = self.bn3.forward(x);
+    // shortcut 处理维度/通道不匹配
+    let residual = match &self.shortcut {
+        Some(proj) => proj.forward(residual),
+        None => residual,
+    };
+    burn::tensor::activation::relu(x + residual)
+}
+```
+
+**初始化策略**：最后一层 BN 的 $\gamma$ 初始化为 0（Burn 中可通过 `Initializer::Zeros` 配置），使初始残差块接近恒等映射，有利于极深网络早期训练。
 
 **梯度流动**：
 $$
 \frac{\partial \mathcal{L}}{\partial x} = \frac{\partial \mathcal{L}}{\partial y} \cdot \left(1 + \frac{\partial \mathcal{F}}{\partial x}\right)
 $$
-
-即使 $\frac{\partial \mathcal{F}}{\partial x} \approx 0$，梯度仍可通过 $1$ 项回传。
+即使 $\frac{\partial \mathcal{F}}{\partial x} \approx 0$，梯度仍可通过恒等项 $1$ 直接回传。这也是为什么 ResNet 中最后一层 BN 零初始化是安全的——初始时 $\mathcal{F}(x) \approx 0$，整个块退化为恒等映射，梯度通过 $1$ 项无损传播。
 
 ---
 
@@ -807,25 +803,10 @@ Burn 的自动微分后端将注意力分解为基本操作，分别计算梯度
 
 标准注意力 $O(n^2 d)$ 复杂度对长序列不可行，需优化：
 
-- **FlashAttention** [Dao et al., 2022]：通过分块计算和重计算避免存储 $n \times n$ 注意力矩阵
-  ```rust
-  // 概念性伪代码
-  fn flash_attention(q, k, v, block_size) {
-      for i in 0..n/block_size {
-          for j in 0..n/block_size {
-              // 分块计算注意力分数
-              let scores = q_block[i].matmul(k_block[j].t());
-              // 在线 softmax（数值稳定）
-              let attn = online_softmax(scores);
-              output_block[i] += attn.matmul(v_block[j]);
-          }
-      }
-  }
-  ```
-- **内存高效注意力**：通过重计算中间结果减少内存占用
+- **FlashAttention** [Dao et al., 2022]：Burn 在 CubeCL GPU 后端实现了 FlashAttention（`crates/burn-cubecl/src/kernel/attention/base.rs`），支持 `FlashBlackboxAccelerated`、`FlashUnit`、`Fallback` 等多种策略，通过分块计算和重计算避免存储 $n \times n$ 注意力矩阵。注意这是 GPU 专属优化，NdArray CPU 后端不包含。
 - **线性注意力**：使用核函数近似，复杂度 $O(nd^2)$
   $$ \text{LinearAttn}(Q, K, V) = \phi(Q)(\phi(K)^\top V) $$
-  其中 $\phi$ 为特征映射（如 $\phi(x) = \text{elu}(x) + 1$）
+  其中 $\phi$ 为特征映射（如 $\phi(x) = \text{elu}(x) + 1$）。Burn 目前未内置线性注意力模块，需自定义实现。
 
 **4. 注意力变体与掩码机制**
 
@@ -833,20 +814,11 @@ Burn 的自动微分后端将注意力分解为基本操作，分别计算梯度
 - **局部注意力**：滑动窗口掩码 $M_{ij} = \begin{cases} 0 & |i-j| \leq w \\ -\infty & \text{否则} \end{cases}$
 - **跨步注意力**：稀疏模式减少计算，如 BigBird 的全局+局部+随机注意力
 
-**5. 数值稳定性考量**
+**5. 数值稳定性**
 
-注意力层的数值稳定性关键在 softmax：
-- **在线 softmax**：分块计算时需维护 running max 和 sum 保证数值稳定
-- **混合精度**：使用 fp16 计算但 fp32 累加器，防止下溢
-- **梯度裁剪**：注意力分数可能产生极大梯度，需裁剪
+注意力 softmax 的数值稳定技巧与 §1.1 一致：Burn 的 softmax 实现通过 `x - x.detach().max()` 防溢出。混合精度下，`MixedPrecisionBackend` 自动管理 fp16/fp32 的精度转换。
 
-**6. 多头注意力的并行化**
-
-- **张量并行**：将头分配到不同设备，通过 all-gather 通信合并结果
-- **序列并行**：将序列分块分配到不同设备，需要跨设备通信注意力分数
-- **流水线并行**：将注意力层分配到不同设备，需要激活 checkpointing
-
-**7. 与 §4.7 跳跃连接的联系**
+**6. 与 §4.7 跳跃连接的联系**
 
 Transformer 块中，注意力层通常与残差连接（§4.7）和层归一化（§4.6）结合：
 $$
@@ -854,7 +826,7 @@ $$
 $$
 残差连接确保梯度直接回传，缓解梯度消失。
 
-**8. 计算复杂度分析**
+**7. 计算复杂度分析**
 
 设序列长度 $n$，隐藏维度 $d$，头数 $h$：
 - **标准注意力**：$O(n^2 d + nd^2)$（注意力 + 投影）
@@ -986,9 +958,10 @@ impl<B: Backend> PositionalEncoding<B> {
 
 **RoPE 实现**：`crates/burn-nn/src/modules/rope_encoding.rs`
 ```rust
-impl<B: Backend> RopeEncoding<B> {
+// 实际类名为 RotaryEncoding（非 RopeEncoding）
+impl<B: Backend> RotaryEncoding<B> {
     pub fn forward(&self, x: Tensor<B, 3>, positions: Tensor<B, 1, Int>) -> Tensor<B, 3> {
-        // 应用旋转矩阵到查询和键
+        // 对 query 和 key 施加旋转位置编码
         let rotated = self.apply_rotary_pos_emb(x, positions);
         rotated
     }
@@ -1077,7 +1050,6 @@ struct CNN<B: Backend> {
     pool1: MaxPool2d<B>,
     conv2: Conv2d<B>,
     pool2: MaxPool2d<B>,
-    flatten: Flatten,
     fc1: Linear<B>,
     fc2: Linear<B>,
 }
@@ -1093,8 +1065,9 @@ impl<B: Backend> CNN<B> {
         let x = burn::tensor::activation::relu(x);
         let x = self.pool2.forward(x);
         
-        // 分类器
-        let x = self.flatten.forward(x);
+        // 分类器：使用 reshape 将 4D 特征图展平为 2D
+        let [b, c, h, w] = x.dims();
+        let x = x.reshape([b, c * h * w]);
         let x = self.fc1.forward(x);
         let x = burn::tensor::activation::relu(x);
         self.fc2.forward(x)
@@ -1106,14 +1079,15 @@ impl<B: Backend> CNN<B> {
 
 **残差块实现**：
 ```rust
-use burn::nn::{Conv2d, Conv2dConfig, BatchNorm2d, BatchNorm2dConfig};
+use burn::nn::{Conv2d, Conv2dConfig};
+use burn::nn::norm::{BatchNorm, BatchNormConfig};
 
 #[derive(Module, Debug)]
 struct ResidualBlock<B: Backend> {
     conv1: Conv2d<B>,
-    bn1: BatchNorm2d<B>,
+    bn1: BatchNorm<B>,
     conv2: Conv2d<B>,
-    bn2: BatchNorm2d<B>,
+    bn2: BatchNorm<B>,
     shortcut: Option<Conv2d<B>>,  // 维度不匹配时的投影
 }
 
@@ -1189,10 +1163,10 @@ let output = encoder.forward(input);  // 形状 [32, 128, 512]
 #[derive(Module, Debug)]
 struct TransformerEncoderLayer<B: Backend> {
     self_attn: MultiHeadAttention<B>,
-    feed_forward: FeedForward<B>,
+    feed_forward: PositionWiseFeedForward<B>,
     norm1: LayerNorm<B>,
     norm2: LayerNorm<B>,
-    dropout: Dropout<B>,
+    dropout: Dropout,
 }
 
 impl<B: Backend> TransformerEncoderLayer<B> {
@@ -1236,22 +1210,16 @@ Transformer 的核心设计选择及其数学原理：
 
 **3. 前馈网络实现细节**
 
-前馈网络（FFN）是 Transformer 的关键组件，提供非线性变换：
-```rust
-#[derive(Module, Debug)]
-struct FeedForward<B: Backend> {
-    linear1: Linear<B>,
-    linear2: Linear<B>,
-    dropout: Dropout<B>,
-}
+前馈网络（FFN/PWFF）是 Transformer 的关键组件，Burn 中实现为 `PositionWiseFeedForward`（`crates/burn-nn/src/modules/transformer/pwff.rs`）：
 
-impl<B: Backend> FeedForward<B> {
-    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let x = self.linear1.forward(x);
-        let x = burn::tensor::activation::gelu(x);  // GPT 使用 GELU
-        let x = self.dropout.forward(x);
-        self.linear2.forward(x)
-    }
+```rust
+// PositionWiseFeedForwardConfig::new(d_model, d_ff)  → 内部两层 Linear + Dropout + 激活函数
+#[derive(Module, Debug)]
+pub struct PositionWiseFeedForward<B: Backend> {
+    linear_inner: Linear<B>,   // d_model → d_ff
+    linear_outer: Linear<B>,   // d_ff → d_model
+    dropout: Dropout,
+    activation: Activation<B>, // 默认 GELU
 }
 ```
 
@@ -1277,44 +1245,15 @@ impl<B: Backend> FeedForward<B> {
 - **相对位置编码**：注意力分数中加入相对位置偏置 $B_{i-j}$
 - **旋转位置编码**：RoPE，通过旋转矩阵编码相对位置
 
-**5. Transformer 训练技巧**
+**5. 训练与推理优化**
 
-- **学习率预热**：前 $w$ 步线性增加学习率至初始值，稳定训练初期
-  $$ \eta_t = \frac{t}{w} \cdot \eta_{\text{max}}, \quad t < w $$
-- **权重衰减**：L2 正则化防止过拟合，通常设置为 0.01-0.1
-- **梯度裁剪**：限制梯度范数防止梯度爆炸
-  $$ g \leftarrow g \cdot \frac{\text{clip\_norm}}{\max(\|g\|, \text{clip\_norm})} $$
-- **标签平滑**：将 one-hot 标签软化，防止模型过度自信
+- **学习率调度**：预热 + 余弦退火的组合通过 `ComposedLrScheduler` 实现（见 [`burn_foundations.md` §3.4](burn_foundations.md#34-学习率调度learning-rate-scheduling)）
+- **梯度裁剪**：`GradientClipping::Norm(threshold)` 防止注意力分数导致的梯度爆炸（见 [`burn_foundations.md` §4.2](burn_foundations.md#42-梯度裁剪gradient-clipping)）
+- **混合精度训练**：`Autodiff<MixedPrecisionBackend<Wgpu>>` 在 fp16/bf16 下执行前向传播，内部维护 fp32 主权重副本
+- **KV 缓存**：`TransformerEncoder::new_autoregressive_cache()` 在自回归推理时缓存历史 K, V，避免重复计算
+- **激活 checkpointing**：`Autodiff<B, BalancedCheckpointing>` 在反向传播时重计算部分激活，以计算换内存
 
-**6. 缩放定律与模型扩展**
-
-Kaplan et al. (2020) 提出 Transformer 的幂律缩放：
-$$ L(N, D) \approx \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\right)^{\alpha_D} $$
-其中 $N$ 为参数数，$D$ 为数据量，$\alpha_N \approx 0.076$, $\alpha_D \approx 0.095$。
-
-**7. 并行化策略**
-
-大规模 Transformer 需要多设备并行：
-
-- **数据并行**：不同设备处理不同批次，同步梯度（all-reduce）
-- **张量并行**：将权重矩阵分块到不同设备，需要通信激活和梯度
-- **流水线并行**：将层分配到不同设备，需要流水线气泡和激活 checkpointing
-- **序列并行**：将序列分块分配到不同设备，需要注意力通信
-
-**8. 推理优化技术**
-
-- **键值缓存**：自回归生成时缓存先前时间步的 K, V，避免重复计算
-- **量化**：将权重/激活从 fp32 降至 int8/int4，减少内存和计算
-- **蒸馏**：用小模型学习大模型输出分布，保持性能减少计算
-- **剪枝**：移除不重要的权重/注意力头，创建稀疏模型
-
-**9. 数值稳定性考量**
-
-- **深度 Transformer**：超过 100 层时需使用 Pre-LN 而非 Post-LN 保持稳定
-- **混合精度训练**：使用 fp16 但维护 fp32 主副本防止梯度下溢
-- **激活 checkpointing**：仅存储部分层激活，反向传播时重计算其余层
-
-**10. 与 §5.2 卷积神经网络的对比**
+**6. 与 §5.2 卷积神经网络的对比**
 
 | 特性 | CNN | Transformer |
 |------|-----|-------------|
@@ -1323,7 +1262,7 @@ $$ L(N, D) \approx \left(\frac{N_c}{N}\right)^{\alpha_N} + \left(\frac{D_c}{D}\r
 | **并行性** | 高度并行 | 序列依赖（解码器） |
 | **数据需求** | 较少 | 大量 |
 
-**11. Burn 中的 Transformer 实现**
+**7. Burn 中的 Transformer 实现**
 
 Burn 的 Transformer 模块设计灵活，支持自定义：
 - `TransformerEncoderConfig`：编码器配置
@@ -1407,25 +1346,36 @@ impl<B: Backend> VisionTransformer<B> {
 
 #### 专家：ViT 变体与混合架构
 
-**ViT 变体**：
-- **DeiT**：数据高效图像 Transformer，使用蒸馏令牌
-- **Swin Transformer**：分层移位窗口，线性计算复杂度
-- **MobileViT**：移动设备优化，结合 CNN 和 Transformer
+**ViT 变体与 Burn 实现映射**：
+| 变体 | 关键创新 | Burn 中实现方式 |
+|------|---------|---------------|
+| **ViT** | 补丁嵌入 + CLS 令牌 | `Unfold4d` 切片 + 可学习 `Param<Tensor>` |
+| **DeiT** | 蒸馏令牌 | 额外 `dist_token: Param<Tensor<B, 1>>` 并行于 CLS |
+| **Swin Transformer** | 移位窗口 + 分层结构 | 多尺度 `Unfold4d` + `MultiHeadAttention` + 自定义窗口掩码 |
+| **FlexiViT** | 可变补丁大小 | 统一 `patch_size` 配置，动态计算序列长度 |
 
-**混合架构**：
+**补丁嵌入的 Burn 实现**：使用 `Unfold4d`（`crates/burn-nn/src/modules/unfold.rs`）按核大小=补丁大小、步幅=补丁大小的配置切片，等价于 `Conv2d` 补丁投影的展开式实现：
+
 ```rust
-// CNN + Transformer 混合
-struct HybridViT<B: Backend> {
-    cnn_backbone: CNN<B>,           // 提取局部特征
-    transformer: TransformerEncoder<B>, // 建模全局关系
+// 使用 Conv2d 方案（文档入门示例）：直接投影 + reshape
+let patches = Conv2d::forward(&self.proj, x);
+// 或使用 Unfold4d 方案：先切片为补丁窗口，再线性投影
+let patches = Unfold4d::forward(&self.unfold, x);  // [B, C*P*P, N]
+```
+
+**混合架构模式**——CNN 提取局部特征 + Transformer 建模全局关系：
+```rust
+struct HybridEncoder<B: Backend> {
+    cnn_stem: Conv2d<B>,               // 输入层：局部特征提取
+    transformer: TransformerEncoder<B>, // 全局关系建模
     head: Linear<B>,
 }
 ```
 
 **位置编码策略**：
-- **可学习位置编码**：ViT-B/16 标准配置
-- **相对位置编码**：Swin Transformer
-- **无位置编码**：某些研究表明可能不需要显式位置编码
+- **可学习位置编码**（ViT 标准）：用 `Param<Tensor<B, 2>>` 存储 `[num_patches+1, d_model]` 的可学习嵌入，与补丁嵌入相加
+- **无位置编码**：`Unfold4d` 的滑动窗口天然保留了空间位置信息，浅层可省略位置编码
+- **RotaryEncoding**（§4.10）：用于 ViT 变体中的注意力层位置编码
 
 ---
 
@@ -1544,38 +1494,54 @@ pub enum Architecture {
 
 #### 专家：可扩展性与蒸馏
 
-**模型缩放定律**：
-- **宽度缩放**：增加通道数
-- **深度缩放**：增加层数  
-- **分辨率缩放**：增加输入尺寸
+**通过 `#[derive(Config)]` 实现架构缩放**：Burn 的 Config 模式天然支持参数化模型缩放——层数、通道数、头数均通过配置字段控制：
 
-**知识蒸馏**：
 ```rust
-struct DistillationLoss {
-    temperature: f32,
-    alpha: f32,  // 蒸馏损失权重
-}
-
-impl DistillationLoss {
-    fn forward(
-        &self,
-        student_logits: Tensor<B, 2>,
-        teacher_logits: Tensor<B, 2>,
-        targets: Tensor<B, 1, Int>,
-    ) -> Tensor<B, 1> {
-        // 软目标损失（蒸馏）
-        let soft_loss = kl_divergence(
-            student_logits.div_scalar(self.temperature).softmax(1),
-            teacher_logits.div_scalar(self.temperature).softmax(1),
-        ) * (self.temperature * self.temperature);
-        
-        // 硬目标损失（标准交叉熵）
-        let hard_loss = cross_entropy_loss(student_logits, targets);
-        
-        soft_loss * self.alpha + hard_loss * (1.0 - self.alpha)
-    }
+#[derive(Config)]
+pub struct ScaledTransformerConfig {
+    #[config(default = "6")]
+    pub n_layers: usize,       // 控制深度
+    #[config(default = "512")]
+    pub d_model: usize,        // 控制宽度
+    #[config(default = "8")]
+    pub n_heads: usize,        // 控制注意力并行度
+    #[config(default = "224")]
+    pub image_size: usize,     // 控制输入分辨率
 }
 ```
+
+一个配置结构体即可覆盖从 `Tiny` 到 `Large` 的全系列模型。实际工程中，Burn 的 `TransformerEncoderConfig` 正是通过 `n_layers`、`d_model`、`n_heads`、`d_ff` 四个参数控制模型规模。
+
+**知识蒸馏**——用小模型学习大模型输出分布：
+
+```rust
+// 使用 Burn 内置的损失模块：KLDivLoss + CrossEntropyLoss
+use burn::nn::loss::{KLDivLoss, KLDivLossConfig, CrossEntropyLoss, CrossEntropyLossConfig, Reduction};
+use burn::tensor::activation;
+
+fn distillation_loss<B: Backend>(
+    student_logits: Tensor<B, 2>,
+    teacher_logits: Tensor<B, 2>,
+    targets: Tensor<B, 1, Int>,
+    temperature: f64,
+    alpha: f64,
+) -> Tensor<B, 1> {
+    // 软目标：KL(softmax(teacher/T) || softmax(student/T)) * T²
+    let soft_teacher = activation::softmax(teacher_logits.div_scalar(temperature), 1);
+    let log_soft_student = activation::log_softmax(student_logits.clone().div_scalar(temperature), 1);
+    let kl_loss = KLDivLossConfig { log_target: false }.init();
+    let soft_loss = kl_loss.forward(log_soft_student, soft_teacher, Reduction::BatchMean)
+        .mul_scalar(temperature * temperature);
+
+    // 硬目标：标准交叉熵
+    let ce_loss = CrossEntropyLossConfig::new().init(&student_logits.device());
+    let hard_loss = ce_loss.forward(student_logits, targets);
+
+    soft_loss.mul_scalar(alpha).add(hard_loss.mul_scalar(1.0 - alpha))
+}
+```
+
+蒸馏时通常冻结教师模型（`teacher = teacher.no_grad()`），仅更新学生模型参数。
 
 ---
 

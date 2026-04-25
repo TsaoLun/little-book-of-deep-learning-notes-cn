@@ -391,13 +391,34 @@ pub fn cosine_similarity<B: Backend, const D: usize>(
 
 ### 1.4 其他损失函数
 
-Burn 还提供了多种常见损失函数：
+Burn 还提供了多种常见损失函数，均通过 `Config` + `init()` 模式创建：
 
-- **均方误差（MSE）**：`burn_nn::loss::MseLoss`
-- **平均绝对误差（MAE/L1）**：`burn_nn::loss::LpLoss`
-- **Huber 损失**：`burn_nn::loss::HuberLoss`
-- **KL 散度**：`burn_nn::loss::KLDivLoss`
-- **连接主义时间分类（CTC）**：`burn_nn::loss::CTCLoss`
+**均方误差（MSE）**：`burn_nn::loss::MseLoss`
+
+```rust
+use burn_nn::loss::MseLoss;
+
+let loss = MseLoss::new();
+let predictions = Tensor::random([32, 10], Distribution::Default, &device);
+let targets = Tensor::random([32, 10], Distribution::Default, &device);
+let loss_value = loss.forward(predictions, targets, Reduction::Mean);
+```
+
+**Huber 损失**：`burn_nn::loss::HuberLossConfig`
+
+```rust
+use burn_nn::loss::{HuberLoss, HuberLossConfig};
+
+let loss = HuberLossConfig::new(1.0).init();  // delta=1.0 时为 Huber，delta→0 退化为 MAE
+let loss_value = loss.forward(predictions, targets, Reduction::Mean);
+```
+
+其他可用损失函数：
+- **平均绝对误差（MAE/L1）**：`burn_nn::loss::LpLossConfig` — 可配置 p=1 (MAE) 或 p=2 (MSE)
+- **KL 散度**：`burn_nn::loss::KLDivLossConfig` — 支持 `log_target` 参数
+- **连接主义时间分类（CTC）**：`burn_nn::loss::CTCLossConfig` — 用于序列到序列任务
+
+所有损失函数均支持 `Reduction::Mean / Sum / BatchMean` 三种归约方式。
 
 ---
 
@@ -1323,7 +1344,7 @@ fn clip_by_norm<B: Backend, const D: usize>(
 
 ## 5. 深度的价值（The Value of Depth）
 
-正如“深度学习”一词所示，实用的模型通常是长系列映射的组合 $f = f^{(D)} \circ \cdots \circ f^{(1)}$。用梯度下降训练会使各层产生复杂的共同适应——尽管优化过程是渐进且局部的，但深度模型能够逐层变形输入空间的表示，直到数据变得线性可分。理论结果表明，对于固定的计算预算或参数数量，增加深度会导致模型能表示的映射复杂度更高 [Telgarsky, 2016]。当前最先进的性能需要数十层的模型，如残差网络（见 [§5.2 卷积神经网络](burn_deepmodels.md#52-卷积神经网络卷积神经网络-cnn)）或 Transformer（见 [§5.3 Transformer 架构](burn_deepmodels.md#53-transformer-架构)）。
+正如“深度学习”一词所示，实用的模型通常是长系列映射的组合 $f = f^{(D)} \circ \cdots \circ f^{(1)}$。用梯度下降训练会使各层产生复杂的共同适应——尽管优化过程是渐进且局部的，但深度模型能够逐层变形输入空间的表示，直到数据变得线性可分。理论结果表明，对于固定的计算预算或参数数量，增加深度会导致模型能表示的映射复杂度更高 [Telgarsky, 2016]。当前最先进的性能需要数十层的模型，如残差网络（见 [§5.2 卷积神经网络](burn_deepmodels.md#52-卷积神经网络convolutional-neural-networks-cnn)）或 Transformer（见 [§5.3 Transformer 架构](burn_deepmodels.md#53-transformer-架构)）。
 
 #### 入门：模块化层组合
 
@@ -1347,9 +1368,9 @@ use burn::{
 #[derive(Module, Debug)]
 struct ConvNet<B: Backend> {
     conv1: burn::nn::conv::Conv2d<B>,
-    bn1:   burn::nn::norm::BatchNorm<B, 2>,
+    bn1:   burn::nn::norm::BatchNorm<B>,
     conv2: burn::nn::conv::Conv2d<B>,
-    bn2:   burn::nn::norm::BatchNorm<B, 2>,
+    bn2:   burn::nn::norm::BatchNorm<B>,
     fc:    Linear<B>,
 }
 
@@ -1365,7 +1386,7 @@ impl<B: Backend> ConvNet<B> {
     }
 
     fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 2> {
-        // 逐层手动调用，直观对应 [§3.5](burn_deepmodels.md#41-层的概念) 中的 f = f^(D) ∘ ... ∘ f^(1)
+        // 逐层手动调用，直观对应 [§3.5](burn_deepmodels.md#41-层的概念the-concept-of-layers) 中的 f = f^(D) ∘ ... ∘ f^(1)
         let x = relu(self.bn1.forward(self.conv1.forward(x)));
         let x = relu(self.bn2.forward(self.conv2.forward(x)));
         let [b, c, h, w] = x.dims();
@@ -1374,7 +1395,7 @@ impl<B: Backend> ConvNet<B> {
 }
 ```
 
-> `#[derive(Module)]` 是 Burn 的核心设计：结构体字段自动成为可训练参数，`Module` trait 提供 `.to_device()`、`.no_grad()`、`.fork()` 等方法。层数越多，`forward` 中链式调用越长，直观映射了 [§3.5](burn_deepmodels.md#41-层的概念) 中"$D$ 个映射的组合"。
+> `#[derive(Module)]` 是 Burn 的核心设计：结构体字段自动成为可训练参数，`Module` trait 提供 `.to_device()`、`.no_grad()`、`.fork()` 等方法。层数越多，`forward` 中链式调用越长，直观映射了 [§3.5](burn_deepmodels.md#41-层的概念the-concept-of-layers) 中"$D$ 个映射的组合"。
 
 #### 进阶：Module trait 的核心接口
 
