@@ -203,7 +203,105 @@ initializer: Initializer::KaimingUniform {
 - Xavier: $$\sigma = \sqrt{\frac{2}{fan_{in}+fan_{out}}}$$
 - Kaiming: $$\sigma = \frac{1}{\sqrt{fan}}$$（再乘对应 gain）
 
-**2) `LinearLayout::Col` 的重点在“参数存储布局”，不是改变前向公式**
+**gain 与 fan 详解**：
+
+**fan（扇入/扇出）**：fan_in 是输入连接数（`d_input`），fan_out 是输出连接数（`d_output`）。对于线性层 $Y = XW + b$（$[\ldots, d_{in}] \times [d_{in}, d_{out}] \to [\ldots, d_{out}]$），每个输出神经元接收 $d_{in}$ 个输入。
+
+**`fan_out_only` 旗标 — 前向方差 vs 反向梯度稳定**：
+
+`fan_out_only` 的选择背后是两条不同的"方差稳定"目标：
+
+- **`false`（fan_in 模式）**：初始化方差由 $1/fan\_in$ 决定，目标是在 **前向传播** 中保持每层激活值的方差不变 —— 即 $Var(y_l) \approx Var(y_{l-1})$。
+- **`true`（fan_out 模式）**：初始化方差由 $1/fan\_out$ 决定，目标是在 **反向传播** 中保持每层梯度的方差不变 —— 即 $Var(\partial L/\partial x_l) \approx Var(\partial L/\partial x_{l-1})$。
+
+**为什么不能同时满足**：
+
+对于线性层 $y = xW$（$W \in \mathbb{R}^{fan\_in \times fan\_out}$）：
+
+| 方向 | 方差关系 | 需要 $Var(W)$ |
+|------|---------|--------------|
+| **前向** | $Var(y) = fan\_in \cdot Var(W) \cdot Var(x)$ | $\frac{1}{fan\_in}$ |
+| **反向** | $Var(\partial L/\partial x) = fan\_out \cdot Var(W) \cdot Var(\partial L/\partial y)$ | $\frac{1}{fan\_out}$ |
+
+当 $fan\_in \neq fan\_out$ 时，两个条件无法同时满足。必须选择优先保证哪个方向。
+
+**各模式的适用场景**：
+
+| 模式 | 优先保证 | 适合场景 |
+|------|---------|---------|
+| **fan_in**（默认）| 前向激活稳定 | 极深网络（ResNet-152）、窄→宽层 |
+| **fan_out** | 反向梯度稳定 | 宽→窄层（分类头）、GAN 生成器末端 |
+| **Xavier** | 折中（调和平均） | 对称网络、tanh/sigmoid 激活 |
+
+**fan_in 为什么是更好的默认**：
+
+1. **激活爆炸比梯度爆炸更容易扩散**：激活值失控会在前向传播中逐层放大，直接影响所有后续层；梯度失控仅在反向传播中影响前半部分层。前向方差失控的破坏范围更大。
+2. **与归一化层的协同**：BatchNorm / LayerNorm 在前向传播中直接校正激活分布，它们的归一化统计量（均值、方差）依赖稳定的前向激活。前向激活方差过大或过小都会影响归一化效果。
+3. **反向梯度本身有额外的补偿机制**：梯度裁剪（§4.2）、学习率预热（§3.4）、跳跃连接（§4.7）的恒等梯度路径都可以在反向传播中缓解梯度异常。前向激活的异常缺乏同级别的"安全网"。
+4. **He 论文的实证结论**：He et al. (2015) 的实验表明，对于 ReLU 网络，fan_in 模式在 30 层时的收敛效果与 fan_out 模式相当，但在更深的网络中稳定性更好。
+
+**一个具体例子**：
+
+考虑一个 $fan\_in=256, fan\_out=64$ 的线性层（如 CNN 末端的降维层）：
+
+- **fan_in 模式**：$Var(W) = 1/256$ → 前向激活方差稳定，反向梯度方差会被放大 $fan\_out/fan\_in = 0.25$ 倍（实际是缩小，安全）
+- **fan_out 模式**：$Var(W) = 1/64$ → 反向梯度方差稳定，前向激活方差被放大 $fan\_in/fan\_out = 4$ 倍（激活值逐层膨胀）
+
+fan_in 模式在这个例子中更安全——梯度缩小不会导致训练中断，但激活膨胀可能导致数值溢出。
+
+
+
+**gain（增益系数）**：由激活函数决定，用于纠正非线性变换对信号方差的影响：
+
+| 激活函数 | gain（normal） | 原理 |
+|---------|:-----------:|------|
+| Linear / Identity | 1 | 无非线性变换 |
+| ReLU | $\sqrt{2} \approx 1.414$ | ReLU 将一半输出置零，方差减半 |
+| LeakyReLU($a$) | $\sqrt{2/(1+a^2)}$ | 负半轴保留部分信号 |
+| Tanh | $5/3$ | Tanh 在零点的压缩效应 |
+
+**为什么 ReLU 需要 gain = $\sqrt{2}$**：
+
+考虑前向传播 $y = \text{ReLU}(Wx)$，$W$ 的每个元素 i.i.d. 均值为 0：
+
+$$\text{Var}(y_l) = n_l \cdot \text{Var}(w_l) \cdot \text{Var}(y_{l-1}) \cdot \frac{1}{2}$$
+
+其中 $1/2$ 来自 ReLU 将一半输入置零（对称分布经过 ReLU 后方差恰好减半）。要使 $\text{Var}(y_l) = \text{Var}(y_{l-1})$，需要：
+
+$$\text{Var}(w) = \frac{2}{fan\_in}$$
+
+正态分布 $\mathcal{N}(0, \sigma^2)$ 下：$\sigma = \sqrt{2 / fan\_in}$，即 gain = $\sqrt{2}$。
+均匀分布 $U(-a, a)$ 下：$a^2/3 = 2/fan\_in$，即 $a = \sqrt{6 / fan\_in}$。
+
+**Uniform 与 Normal 的方差等价转换**：
+
+- 均匀分布 $U(-a, a)$ 方差 = $a^2/3$
+- 正态分布 $\mathcal{N}(0, \sigma^2)$ 方差 = $\sigma^2$
+- 等价转换：$a = \sigma \cdot \sqrt{3}$
+
+这就是 Burn 代码中 `a = sqrt(3) * gain * kaiming_std` 里 `sqrt(3)` 的来源——将正态分布的标准差换算为均匀分布的边界。
+
+**Kaiming 与 Xavier 的对比**：
+
+| | Kaiming/He | Xavier/Glorot |
+|---|---|---|
+| **标准差** | $gain \cdot 1/\sqrt{fan\_in}$ | $gain \cdot \sqrt{2/(fan\_in + fan\_out)}$ |
+| **激活假设** | ReLU 及变体 | 线性 / tanh / sigmoid |
+| **设计思路** | 仅关注前向方差（fan_in） | 折中前后向方差（调和平均） |
+
+Xavier 假设激活函数在零点附近近似线性，因此取 fan_in 和 fan_out 的调和平均来平衡前向和反向。Kaiming 专为 ReLU 设计——ReLU 在负半轴斜率为 0，线性假设不成立，需要 gain 补偿方差损失。
+
+**Burn 默认 gain = $1/\sqrt{3}$ 的来源**：
+
+这个值与 PyTorch `nn.Linear` 的默认行为一致：
+
+$$\text{PyTorch: } kaiming\_uniform\_(weight, a=\sqrt{5}) \;\Longrightarrow\; gain = \sqrt{\frac{2}{1+a^2}} = \sqrt{\frac{2}{6}} = \frac{1}{\sqrt{3}}$$
+
+代入 Burn 公式：$a_{bound} = \sqrt{3} \cdot \frac{1}{\sqrt{3}} \cdot \frac{1}{\sqrt{fan\_in}} = \frac{1}{\sqrt{fan\_in}}$
+
+这个值的效果介于 gain=1（线性）和 gain=$\sqrt{2}$（ReLU）之间，是一个在实践中验证过的保守默认。如果模型全部使用 ReLU 激活，应将 gain 设为 $\sqrt{2}$ 以获得理论最优的方差保持。
+
+**2) `LinearLayout::Col` 的重点在”参数存储布局”，不是改变前向公式**
 
 `LinearLayout` 有 `Row | Col` 两种布局。
 
